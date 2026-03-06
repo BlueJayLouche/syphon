@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "syphon-core",
+    "syphon-metal",
+    "syphon-wgpu",
+    "syphon-examples",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+authors = ["Your Name <you@example.com>"]
+license = "MIT"
+repository = "https://github.com/yourusername/syphon-rs"
