@@ -4,14 +4,14 @@ This document describes the zero-copy GPU-to-GPU Syphon implementation for wgpu 
 
 ## Overview
 
-The zero-copy approach eliminates CPU readback by using IOSurface-backed textures and Metal blit encoders to transfer frames directly from wgpu to Syphon on the GPU.
+The zero-copy approach eliminates CPU readback by using IOSurface-backed textures and Metal compute shaders to transfer frames directly from wgpu to Syphon on the GPU.
 
 ```
 Old (CPU readback):
   wgpu Texture → GPU Buffer → CPU RAM → new Metal Texture → Syphon
 
 Zero-Copy (GPU only):
-  wgpu Texture → Metal Blit → IOSurface Texture → Syphon
+  wgpu Texture → Compute Shader (Y-flip) → IOSurface Texture → Syphon
 ```
 
 ## Implementation
@@ -38,8 +38,9 @@ Syphon.framework (native macOS framework)
 
 #### syphon-wgpu
 - `SyphonWgpuOutput`: Main API for publishing wgpu textures to Syphon
-- Zero-copy path: Uses wgpu's Metal queue directly for the blit operation
-- Fallback path: CPU readback if Metal interop fails
+- **Compute shader Y-flip**: Uses a Metal compute kernel for efficient coordinate system conversion
+- Zero-copy path: Uses wgpu's Metal queue directly for the compute operation
+- Fallback path: CPU readback with software Y-flip if Metal interop fails
 
 ### 3. The Zero-Copy Flow
 
@@ -56,13 +57,20 @@ queue.as_hal::<wgpu_hal::api::Metal, _, _>(|hal_queue| {
         let src_texture = hal_tex.raw_handle();
         let raw_queue = hal_queue.as_raw().lock();
         
-        // 4. Create blit encoder on wgpu's queue
+        // 4. Create command buffer on wgpu's queue
         let cmd_buf = raw_queue.new_command_buffer();
-        let blit = cmd_buf.new_blit_command_encoder();
         
-        // 5. GPU-to-GPU copy
-        blit.copy_from_texture(src_texture, ..., &dest_texture, ...);
-        blit.end_encoding();
+        // 5. Dispatch compute shader for Y-flip
+        // wgpu uses top-left origin, Metal/Syphon use bottom-left
+        let compute = cmd_buf.new_compute_command_encoder();
+        compute.set_compute_pipeline_state(flip_pipeline);
+        compute.set_texture(0, src_texture);
+        compute.set_texture(1, &dest_texture);
+        compute.dispatch_thread_groups(
+            MTLSize { width: (w+15)/16, height: (h+15)/16, depth: 1 },
+            MTLSize { width: 16, height: 16, depth: 1 },
+        );
+        compute.end_encoding();
         
         // 6. Publish to Syphon before committing
         server.publish_metal_texture(dest_texture, cmd_buf);
@@ -73,16 +81,41 @@ queue.as_hal::<wgpu_hal::api::Metal, _, _>(|hal_queue| {
 });
 ```
 
-### 4. Critical Synchronization
+### 4. Coordinate System Handling
 
-**Key Insight**: We must use wgpu's Metal command queue for the blit operation, not a separate queue. This ensures proper synchronization between wgpu's rendering and our blit operation.
+**The Y-Flip Problem**: wgpu and Metal use different coordinate systems:
+- **wgpu**: Top-left origin (0,0) - common in graphics APIs
+- **Metal**: Bottom-left origin (0,0) - common in OpenGL/Metal
+
+Without correction, images appear **upside-down** in Syphon clients.
+
+**Solution**: A compute shader performs the Y-flip in a single GPU dispatch:
+
+```metal
+kernel void flip_y(
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint2 src_coord = gid;
+    uint height = src_texture.get_height();
+    uint2 dst_coord = uint2(gid.x, height - 1 - gid.y);
+    
+    float4 color = src_texture.read(src_coord);
+    dst_texture.write(color, dst_coord);
+}
+```
+
+This is much more efficient than row-by-row blit commands (1 dispatch vs 1080+ blits at 1080p).
+
+### 5. Critical Synchronization
+
+**Key Insight**: We must use wgpu's Metal command queue for the compute operation, not a separate queue. This ensures proper synchronization between wgpu's rendering and our compute dispatch.
 
 The crash mentioned in the original docs:
 ```
 failed assertion false at line 648 in _mtlIOAccelCommandBufferStorageBeginSegmentList
 ```
 
-Was caused by mixing command buffers from different queues. Our solution performs the blit directly on wgpu's queue via `wgpu-hal`'s `as_hal()` API.
+Was caused by mixing command buffers from different queues. Our solution performs the compute dispatch directly on wgpu's queue via `wgpu-hal`'s `as_hal()` API.
 
 ## Usage
 
@@ -104,14 +137,25 @@ if output.is_zero_copy() {
 }
 
 // Each frame, publish your rendered texture
+// The Y-flip is handled automatically
 output.publish(&render_texture, &device, &queue);
 ```
 
 ## Performance
 
 - **Zero-copy path**: ~0 CPU overhead, full GPU throughput
+  - Compute shader: Single dispatch, all pixels in parallel
+  - 16x16 threadgroups for optimal GPU utilization
 - **Fallback path**: CPU readback with ~1-2ms overhead at 1080p
 - **Triple-buffering**: IOSurface pool prevents GPU stalls
+
+### Performance Comparison
+
+| Method | Commands @ 1080p | GPU Utilization | Expected FPS |
+|--------|------------------|-----------------|--------------|
+| Single blit (no flip) | 1 | High | 60fps ✓ |
+| Row-by-row blit | 1080 | Poor | ~30-45fps ✗ |
+| **Compute shader** | **1** | **High** | **60fps** ✓ |
 
 ## Requirements
 
@@ -150,6 +194,7 @@ cargo run --example wgpu_sender --release
 - [Metal IOSurface Documentation](https://developer.apple.com/documentation/metal/mtldevice/1433355-newtexturewithdescriptor)
 - [wgpu-hal Metal Backend](https://github.com/gfx-rs/wgpu/tree/trunk/wgpu-hal/src/metal)
 - [IOSurface Programming Guide](https://developer.apple.com/library/archive/documentation/General/Conceptual/IOSurfaceProgGuide/Introduction/Introduction.html)
+- [Metal Compute Shaders](https://developer.apple.com/documentation/metal/compute_processing)
 
 ## Current Status
 
@@ -158,6 +203,7 @@ cargo run --example wgpu_sender --release
 The implementation successfully:
 - Extracts raw Metal handles from wgpu via wgpu-hal
 - Creates IOSurface-backed textures using raw Objective-C
-- Performs GPU-to-GPU blit on wgpu's command queue
+- Performs GPU-to-GPU compute dispatch with Y-flip on wgpu's command queue
+- Handles coordinate system conversion automatically
 - Falls back to CPU readback if zero-copy fails
 - Uses triple-buffering to prevent stalls

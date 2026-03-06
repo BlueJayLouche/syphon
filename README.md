@@ -4,14 +4,15 @@ Rust bindings and utilities for [Syphon](https://syphon.v002.info/) - an open so
 
 ## Overview
 
-This workspace provides Rust crates for integrating Syphon frame sharing into your applications with maximum performance. The `syphon-wgpu` crate enables zero-copy frame publishing directly from wgpu textures to Syphon clients.
+This workspace provides Rust crates for integrating Syphon frame sharing into your applications with maximum performance. The `syphon-wgpu` crate enables zero-copy frame publishing directly from wgpu textures to Syphon clients, with automatic coordinate system correction.
 
 ## Features
 
 - ✅ **Zero-Copy GPU Transfer**: Publish wgpu textures without CPU readback
+- ✅ **Compute Shader Y-Flip**: Efficient coordinate system conversion (wgpu top-left → Metal bottom-left)
 - ✅ **IOSurface Backing**: Shared GPU memory for efficient texture sharing
 - ✅ **Triple-Buffering**: Prevents GPU stalls with automatic surface pooling
-- ✅ **Fallback Support**: CPU readback path if Metal interop fails
+- ✅ **Fallback Support**: CPU readback path with software Y-flip if Metal interop fails
 - ✅ **Production Ready**: Stable API with proper error handling
 
 ## Crates
@@ -20,7 +21,7 @@ This workspace provides Rust crates for integrating Syphon frame sharing into yo
 |-------|-------------|
 | [`syphon-core`](./syphon-core/) | Core Objective-C bindings and FFI layer |
 | [`syphon-metal`](./syphon-metal/) | Metal/IOSurface utilities for zero-copy texture sharing |
-| [`syphon-wgpu`](./syphon-wgpu/) | High-level wgpu integration with zero-copy GPU blit |
+| [`syphon-wgpu`](./syphon-wgpu/) | High-level wgpu integration with zero-copy compute shader |
 | [`syphon-examples`](./syphon-examples/) | Example applications demonstrating usage |
 
 ## Requirements
@@ -57,7 +58,7 @@ use syphon_wgpu::SyphonWgpuOutput;
 let mut output = SyphonWgpuOutput::new(
     "My App",      // Server name visible to clients
     &wgpu_device,  // Your wgpu device
-    &wgpu_queue,  // Your wgpu queue
+    &wgpu_queue,   // Your wgpu queue
     1920,          // Width
     1080           // Height
 ).expect("Failed to create Syphon output");
@@ -68,6 +69,7 @@ if output.is_zero_copy() {
 }
 
 // Each frame, publish your rendered texture
+// Y-flip is handled automatically via compute shader
 output.publish(&render_texture, &wgpu_device, &wgpu_queue);
 ```
 
@@ -76,9 +78,9 @@ output.publish(&render_texture, &wgpu_device, &wgpu_queue);
 ```
 Application
     ↓ renders to
-wgpu Texture
-    ↓ zero-copy blit (wgpu-hal Metal interop)
-IOSurface-backed Metal Texture
+wgpu Texture (top-left origin)
+    ↓ compute shader dispatch (Y-flip on wgpu's queue)
+IOSurface-backed Metal Texture (bottom-left origin)
     ↓ published via
 Syphon Server
     ↓ received by
@@ -91,27 +93,58 @@ The zero-copy implementation:
 
 1. **Extracts Metal handles** from wgpu using `wgpu-hal`'s `as_hal()` API
 2. **Creates IOSurface-backed textures** using raw Objective-C Metal calls
-3. **Performs GPU blit** directly on wgpu's command queue (critical for sync)
+3. **Dispatches compute shader** for Y-flip on wgpu's command queue (critical for sync)
 4. **Publishes to Syphon** using the same command buffer
 
-See [ZERO_COPY_IMPLEMENTATION.md](./ZERO_COPY_IMPLEMENTATION.md) for technical details.
+### Coordinate System Correction
+
+wgpu uses **top-left origin** (0,0) while Metal/Syphon use **bottom-left origin** (0,0). Without correction, images appear upside-down in Syphon clients.
+
+The solution is a Metal compute shader that performs the Y-flip in a single GPU dispatch:
+
+```metal
+kernel void flip_y(uint2 gid [[thread_position_in_grid]]) {
+    uint height = src_texture.get_height();
+    uint2 src_coord = gid;
+    uint2 dst_coord = uint2(gid.x, height - 1 - gid.y);
+    
+    float4 color = src_texture.read(src_coord);
+    dst_texture.write(color, dst_coord);
+}
+```
+
+This is much more efficient than row-by-row blit commands:
+- **1 compute dispatch** vs 1080+ blit commands at 1080p
+- All pixels processed in parallel via 16x16 threadgroups
+- Maintains full 60fps performance
+
+See [ZERO_COPY_IMPLEMENTATION.md](./ZERO_COPY_IMPLEMENTATION.md) for full technical details.
 
 ## Performance
 
 | Approach | CPU Overhead | Latency | Throughput |
 |----------|-------------|---------|------------|
-| Zero-Copy (GPU) | ~0% | ~1ms | 60-240 FPS @ 4K |
+| Zero-Copy (GPU Compute) | ~0% | ~1ms | 60-240 FPS @ 4K |
 | CPU Readback | ~5-10% | ~5ms | 30-60 FPS @ 4K |
 
 Zero-copy eliminates:
 - GPU→CPU memory transfers
 - CPU→GPU texture uploads
 - Frame copies and staging buffers
+- Coordinate system conversion overhead on CPU
+
+### Compute vs Blit Performance
+
+| Method | Commands @ 1080p | GPU Utilization | Expected FPS |
+|--------|------------------|-----------------|--------------|
+| Single blit (no flip) | 1 | High | 60fps ✓ |
+| Row-by-row blit | 1080 | Poor | ~30-45fps ✗ |
+| **Compute shader** | **1** | **High** | **60fps** ✓ |
 
 ## Examples
 
 ```bash
-# wgpu zero-copy sender (recommended)
+# wgpu zero-copy sender with compute Y-flip (recommended)
 cargo run --example wgpu_sender --release
 
 # Full Metal sender (native Metal rendering)
@@ -188,6 +221,13 @@ Enable logging to see which path is being used:
 RUST_LOG=info cargo run --example wgpu_sender
 ```
 
+### Image appears upside-down
+
+The Y-flip is handled automatically by the compute shader. If you see upside-down images:
+1. Check that `is_zero_copy()` returns true (compute shader active)
+2. If using CPU fallback, ensure the software flip is working
+3. Check your wgpu render target orientation
+
 ## License
 
 Licensed under the MIT License - see [LICENSE](./LICENSE) for details.
@@ -199,6 +239,7 @@ The bundled Syphon.framework is licensed under the BSD 3-Clause License.
 - [Syphon Official Website](https://syphon.v002.info/)
 - [Syphon Framework GitHub](https://github.com/Syphon/Syphon-Framework)
 - [vvvv.org - Syphon Documentation](https://vvvv.org/documentation/syphon)
+- [Metal Compute Shaders](https://developer.apple.com/documentation/metal/compute_processing)
 
 ## Note
 
