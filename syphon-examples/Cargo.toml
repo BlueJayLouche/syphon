@@ -14,5 +14,5 @@ log = "0.4"
 bytemuck = { version = "1.21", features = ["derive"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-metal = "0.24"
+metal = "0.31"
 objc = "0.2"

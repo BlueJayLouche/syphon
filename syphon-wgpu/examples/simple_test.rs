@@ -31,7 +31,7 @@ fn main() {
     
     // Create Syphon output
     println!("\nCreating Syphon output ({}x{})...", width, height);
-    let mut syphon = syphon_wgpu::SyphonWgpuOutput::new("Syphon Test", &device, width, height)
+    let mut syphon = syphon_wgpu::SyphonWgpuOutput::new("Syphon Test", &device, &queue, width, height)
         .expect("Failed to create Syphon output");
     println!("✓ Syphon output created");
     

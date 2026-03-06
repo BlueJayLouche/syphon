@@ -12,6 +12,10 @@ fn main() {
             println!("cargo:rustc-link-search=framework={}", framework_path.parent().unwrap().display());
         }
         
+        // Add standard system framework paths
+        println!("cargo:rustc-link-search=framework=/Library/Frameworks");
+        println!("cargo:rustc-link-search=framework=/System/Library/Frameworks");
+        
         println!("cargo:rustc-link-lib=framework=Syphon");
         println!("cargo:rustc-link-lib=framework=IOSurface");
         println!("cargo:rustc-link-lib=framework=CoreFoundation");

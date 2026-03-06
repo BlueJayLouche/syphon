@@ -13,16 +13,18 @@ log = "0.4"
 
 # macOS-specific dependencies
 [target.'cfg(target_os = "macos")'.dependencies]
-metal = "0.24"
+metal = "0.31"
 core-foundation = "0.9"
 core-graphics = "0.23"
 io-surface = "0.15"
 cocoa = "0.25"
 objc = "0.2"
+foreign-types-shared = "0.3"
 
 # Optional wgpu interop
 wgpu = { version = "25.0", optional = true }
+wgpu-hal = { version = "25.0", optional = true }
 
 [features]
 default = []
-wgpu = ["dep:wgpu"]
+wgpu = ["dep:wgpu", "dep:wgpu-hal"]

@@ -41,7 +41,7 @@ fn main() {
     println!("\nCreating Syphon server '{}' ({}x{})...", server_name, width, height);
     
     // Create the Syphon output
-    let mut syphon_output = match syphon_wgpu::SyphonOutput::new(server_name, &device, width, height) {
+    let mut syphon_output = match syphon_wgpu::SyphonWgpuOutput::new(server_name, &device, &queue, width, height) {
         Ok(output) => {
             println!("✓ Syphon server created");
             output
@@ -94,9 +94,7 @@ fn main() {
         let texture = renderer.render(&device, &queue, elapsed);
         
         // Publish to Syphon
-        if let Err(e) = syphon_output.publish_frame(&texture, &queue) {
-            eprintln!("Failed to publish frame: {}", e);
-        }
+        syphon_output.publish(&texture, &device, &queue);
         
         frame_count += 1;
         
