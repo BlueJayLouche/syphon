@@ -1,4 +1,26 @@
 //! Syphon Server Directory - Lists available Syphon servers
+//!
+//! # Important Note: Empty Server Names
+//!
+//! Some Syphon servers (like the official "Simple Server" example app) may have
+//! an empty `name` field. This is valid behavior - servers are not required to
+//! have a display name. Always check if `name` is empty and fall back to
+//! `app_name` when displaying server lists or matching servers.
+//!
+//! ```rust,no_run
+//! use syphon_core::SyphonServerDirectory;
+//!
+//! let servers = SyphonServerDirectory::servers();
+//! for server in servers {
+//!     // Use app_name as fallback when name is empty
+//!     let display_name = if server.name.is_empty() {
+//!         &server.app_name
+//!     } else {
+//!         &server.name
+//!     };
+//!     println!("Server: {}", display_name);
+//! }
+//! ```
 
 use crate::{Result, SyphonError};
 
@@ -8,16 +30,68 @@ use objc::runtime::{Class, Object};
 use objc::{msg_send, sel, sel_impl};
 
 /// Information about a Syphon server
+///
+/// # Note on Empty Names
+///
+/// The `name` field may be an empty string for some servers (e.g., the official
+/// "Simple Server" app). This is valid - servers are not required to have a
+/// display name. Use the [`display_name()`](ServerInfo::display_name) method
+/// to get a user-friendly name that handles this automatically.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use syphon_core::SyphonServerDirectory;
+///
+/// let servers = SyphonServerDirectory::servers();
+/// for server in servers {
+///     // Use display_name() for UI - handles empty names automatically
+///     println!("Found: {}", server.display_name());
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct ServerInfo {
     /// The server name (what users see)
+    /// 
+    /// **May be empty!** Some servers don't set a display name. Use 
+    /// [`display_name()`](ServerInfo::display_name) for UI instead.
     pub name: String,
     /// The server UUID (unique identifier)
     pub uuid: String,
     /// The application that owns the server
+    /// 
+    /// Examples: "Simple Server", "rusty-404", "Resolume Arena"
     pub app_name: String,
     /// The application bundle identifier
     pub bundle_id: String,
+}
+
+impl ServerInfo {
+    /// Get the display name for this server
+    ///
+    /// Returns `name` if it's not empty, otherwise falls back to `app_name`.
+    /// This handles servers like the official "Simple Server" app which has
+    /// an empty `name` but a valid `app_name`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use syphon_core::SyphonServerDirectory;
+    ///
+    /// let servers = SyphonServerDirectory::servers();
+    /// for server in servers {
+    ///     // Safe for UI - never returns empty string
+    ///     let display = server.display_name();
+    ///     println!("Server: {}", display);
+    /// }
+    /// ```
+    pub fn display_name(&self) -> &str {
+        if self.name.is_empty() {
+            &self.app_name
+        } else {
+            &self.name
+        }
+    }
 }
 
 /// The Syphon server directory - lists all available servers
