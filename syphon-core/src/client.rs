@@ -144,69 +144,130 @@ impl SyphonClient {
     #[cfg(target_os = "macos")]
     fn connect_macos(server_name: &str) -> Result<Self> {
         use crate::utils::{to_nsstring, from_nsstring};
+        use objc::rc::autoreleasepool;
         
         unsafe {
-            // Find the server in the directory
-            let servers = crate::directory::SyphonServerDirectory::servers();
-            
-            let server_info = servers.iter()
-                .find(|s| s.name == server_name)
-                .ok_or_else(|| SyphonError::ServerNotFound(
-                    server_name.to_string()
-                ))?;
-            
-            // Get SyphonClient class
-            let cls = Class::get("SyphonClient")
-                .ok_or_else(|| SyphonError::FrameworkNotFound(
-                    "SyphonClient class not found".to_string()
-                ))?;
-            
-            // Get the server description dictionary
-            let dir_cls = Class::get("SyphonServerDirectory")
-                .ok_or_else(|| SyphonError::FrameworkNotFound(
-                    "SyphonServerDirectory not found".to_string()
-                ))?;
-            let dir: *mut Object = msg_send![dir_cls, sharedDirectory];
-            
-            // Look up server by name
-            let ns_name = to_nsstring(server_name)?;
-            let server_desc: *mut Object = msg_send![
-                dir,
-                serverDescriptionForName: ns_name
-            ];
-            let _: () = msg_send![ns_name, release];
-            
-            if server_desc.is_null() {
-                return Err(SyphonError::ServerNotFound(
-                    server_name.to_string()
-                ));
-            }
-            
-            // Create the client with a frame handler
-            // The frame handler is called when a new frame is available
-            let obj: *mut Object = msg_send![cls, alloc];
-            let obj: *mut Object = msg_send![
-                obj,
-                initWithServerDescription: server_desc
-                options: std::ptr::null_mut::<Object>()
-                newFrameHandler: std::ptr::null_mut::<Object>()  // We'll poll instead
-            ];
-            
-            let _: () = msg_send![server_desc, release];
-            
-            if obj.is_null() {
-                return Err(SyphonError::CreateFailed(
-                    "Failed to create SyphonClient".to_string()
-                ));
-            }
-            
-            let inner = ShareId::from_ptr(obj);
-            
-            Ok(Self {
-                inner,
-                server_name: server_info.name.clone(),
-                server_app: server_info.app_name.clone(),
+            autoreleasepool(|| {
+                // Get SyphonServerDirectory
+                let dir_cls = Class::get("SyphonServerDirectory")
+                    .ok_or_else(|| SyphonError::FrameworkNotFound(
+                        "SyphonServerDirectory not found".to_string()
+                    ))?;
+                let dir: *mut Object = msg_send![dir_cls, sharedDirectory];
+                
+                // Request server announcements
+                let _: () = msg_send![dir, requestServerAnnounce];
+                
+                // Poll for servers with run loop processing
+                // Note: serversMatchingName:appName: doesn't always work, so we use servers
+                let mut server_desc: *mut Object = std::ptr::null_mut();
+                
+                for attempt in 0..30 {
+                    // Process run loop to receive distributed notifications
+                    let run_loop: *mut Object = msg_send![Class::get("NSRunLoop").unwrap(), currentRunLoop];
+                    let date: *mut Object = msg_send![Class::get("NSDate").unwrap(), dateWithTimeIntervalSinceNow:0.05];
+                    let _: () = msg_send![run_loop, runUntilDate:date];
+                    
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    
+                    // Get all servers and look for match by name OR app name
+                    let servers: *mut Object = msg_send![dir, servers];
+                    let count: usize = msg_send![servers, count];
+                    
+                    log::debug!("Attempt {}: found {} servers", attempt + 1, count);
+                    
+                    for i in 0..count {
+                        let desc: *mut Object = msg_send![servers, objectAtIndex:i];
+                        let name = Self::get_string_from_desc(desc, "SyphonServerDescriptionNameKey");
+                        let app = Self::get_string_from_desc(desc, "SyphonServerDescriptionAppNameKey");
+                        
+                        log::debug!("  Server {}: name='{}', app='{}'", i, name, app);
+                        
+                        // Match by name OR by app name (Simple Server has empty name)
+                        if name == server_name || app == server_name {
+                            server_desc = desc;
+                            let _: () = msg_send![server_desc, retain];
+                            break;
+                        }
+                    }
+                    
+                    if !server_desc.is_null() {
+                        break;
+                    }
+                }
+                
+                if server_desc.is_null() {
+                    return Err(SyphonError::ServerNotFound(
+                        server_name.to_string()
+                    ));
+                }
+                let _: () = msg_send![server_desc, retain];
+                
+                // Get server info
+                let name = Self::get_string_from_desc(server_desc, "SyphonServerDescriptionNameKey");
+                let app = Self::get_string_from_desc(server_desc, "SyphonServerDescriptionAppNameKey");
+                
+                log::info!("Connecting to server: '{}' from '{}'", name, app);
+                
+                // Get SyphonClient class
+                let cls = Class::get("SyphonClient")
+                    .ok_or_else(|| SyphonError::FrameworkNotFound(
+                        "SyphonClient class not found".to_string()
+                    ))?;
+                
+                // Create the client
+                let obj: *mut Object = msg_send![cls, alloc];
+                let obj: *mut Object = msg_send![
+                    obj,
+                    initWithServerDescription: server_desc
+                    options: std::ptr::null_mut::<Object>()
+                    newFrameHandler: std::ptr::null_mut::<Object>()
+                ];
+                
+                let _: () = msg_send![server_desc, release];
+                
+                if obj.is_null() {
+                    return Err(SyphonError::CreateFailed(
+                        "Failed to create SyphonClient".to_string()
+                    ));
+                }
+                
+                // Check if client is valid
+                let is_valid: bool = msg_send![obj, isValid];
+                if !is_valid {
+                    return Err(SyphonError::CreateFailed(
+                        "Client is not valid - server may have stopped".to_string()
+                    ));
+                }
+                
+                let inner = ShareId::from_ptr(obj);
+                
+                Ok(Self {
+                    inner,
+                    server_name: name,
+                    server_app: app,
+                })
             })
+        }
+    }
+    
+    /// Helper to get string from server description dictionary
+    #[cfg(target_os = "macos")]
+    unsafe fn get_string_from_desc(desc: *mut Object, key: &str) -> String {
+        use crate::utils::{to_nsstring, from_nsstring};
+        
+        let key_obj = match to_nsstring(key) {
+            Ok(k) => k,
+            Err(_) => return String::new(),
+        };
+        
+        // Use objectForKey: with the actual constant key string
+        let value: *mut Object = msg_send![desc, objectForKey:key_obj];
+        
+        if value.is_null() {
+            String::new()
+        } else {
+            from_nsstring(value)
         }
     }
     
