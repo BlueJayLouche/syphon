@@ -31,41 +31,77 @@ impl Frame {
         self.surface.get_id()
     }
     
-    /// Lock the surface for reading (returns base address)
+    /// Get a reference to the underlying IOSurface
     /// 
-    /// Don't forget to unlock when done!
+    /// This allows zero-copy access to the frame data by creating a Metal texture
+    /// directly from the IOSurface.
     #[cfg(target_os = "macos")]
-    pub fn lock(&mut self) -> Result<*mut u8> {
-        use crate::iosurface_ext::{IOSurfaceLock, kIOSurfaceLockReadOnly};
+    pub fn iosurface(&self) -> &io_surface::IOSurface {
+        &self.surface
+    }
+    
+    /// Get the raw IOSurface reference
+    /// 
+    /// # Safety
+    /// The returned pointer is only valid as long as this Frame exists.
+    /// The caller must not release or modify the surface.
+    #[cfg(target_os = "macos")]
+    pub fn iosurface_ref(&self) -> io_surface::IOSurfaceRef {
+        self.surface.as_concrete_TypeRef()
+    }
+    
+    /// Lock the surface for reading (returns base address and seed)
+    /// 
+    /// Don't forget to unlock when done! Use the returned seed for unlock.
+    #[cfg(target_os = "macos")]
+    pub fn lock(&mut self) -> Result<(*mut u8, u32)> {
+        use crate::iosurface_ext::{IOSurfaceLock, kIOSurfaceLockReadOnly, kIOSurfaceLockAvoidSync};
         
         unsafe {
             let surface_ref = self.surface.as_CFTypeRef() as io_surface::IOSurfaceRef;
             let mut seed = 0u32;
             
+            // Try with read-only flag first
             let result = IOSurfaceLock(surface_ref, kIOSurfaceLockReadOnly, &mut seed);
             
             if result != 0 {
-                return Err(SyphonError::LockFailed);
+                log::debug!("[Syphon Frame] IOSurfaceLock failed with error code: {}. Retrying with avoid sync...", result);
+                
+                // Try with avoid sync flag as fallback
+                let result2 = IOSurfaceLock(surface_ref, kIOSurfaceLockReadOnly | kIOSurfaceLockAvoidSync, &mut seed);
+                if result2 != 0 {
+                    log::warn!("[Syphon Frame] IOSurfaceLock retry failed with error code: {}", result2);
+                    return Err(SyphonError::LockFailed);
+                }
             }
             
             let addr = crate::iosurface_ext::IOSurfaceGetBaseAddress(surface_ref);
             
-            Ok(addr as *mut u8)
+            if addr.is_null() {
+                log::error!("[Syphon Frame] IOSurfaceGetBaseAddress returned null");
+                let _ = self.unlock(seed);
+                return Err(SyphonError::LockFailed);
+            }
+            
+            Ok((addr as *mut u8, seed))
         }
     }
     
-    /// Unlock the surface
+    /// Unlock the surface with the seed from lock
     #[cfg(target_os = "macos")]
-    pub fn unlock(&mut self) -> Result<()> {
+    pub fn unlock(&mut self, seed: u32) -> Result<()> {
         use crate::iosurface_ext::IOSurfaceUnlock;
         
         unsafe {
             let surface_ref = self.surface.as_CFTypeRef() as io_surface::IOSurfaceRef;
-            let mut seed = 0u32;
+            let mut seed_copy = seed;
             
-            let result = IOSurfaceUnlock(surface_ref, 0, &mut seed);
+            let result = IOSurfaceUnlock(surface_ref, 0, &mut seed_copy);
             
             if result != 0 {
+                // Log at trace level only - this happens frequently with some servers
+                // and doesn't affect functionality since we've already copied the data
+                log::trace!("[Syphon Frame] IOSurfaceUnlock failed with error code: {} (ignoring)", result);
                 return Err(SyphonError::LockFailed);
             }
             
@@ -88,15 +124,35 @@ impl Frame {
     pub fn to_vec(&mut self) -> Result<Vec<u8>> {
         use std::slice;
         
-        let addr = self.lock()?;
+        // Try to lock the surface and get the seed
+        let (addr, seed) = match self.lock() {
+            Ok(result) => result,
+            Err(e) => {
+                log::error!("[Syphon Frame] Failed to lock IOSurface: {:?}", e);
+                return Err(e);
+            }
+        };
+        
         let height = self.height as usize;
         let stride = self.bytes_per_row();
         let size = height * stride;
         
+        log::trace!("[Syphon Frame] Locked surface (seed={}), copying {} bytes ({}x{}, stride={})", 
+            seed, size, self.width, self.height, stride);
+        
         unsafe {
             let data = slice::from_raw_parts(addr, size);
             let result = data.to_vec();
-            self.unlock()?;
+            
+            // Try to unlock the surface with the same seed
+            // Note: Unlock can fail if the surface was already unlocked or
+            // if there's a synchronization issue, but we've already copied the data
+            if let Err(_) = self.unlock(seed) {
+                // Silently ignore unlock errors - the data is already copied
+                // This happens frequently with some Syphon servers and doesn't affect functionality
+            }
+            
+            log::trace!("[Syphon Frame] Successfully copied frame data");
             Ok(result)
         }
     }
@@ -119,12 +175,19 @@ unsafe impl Sync for SyphonClient {}
 impl SyphonClient {
     /// Connect to a Syphon server by name
     ///
+    /// Matches against both the server's `name` and `app_name` fields. This handles
+    /// servers with empty names (like the official "Simple Server" app) that only
+    /// have an `app_name`.
+    ///
     /// # Example
     ///
     /// ```no_run
     /// use syphon_core::SyphonClient;
     ///
-    /// let client = SyphonClient::connect("Resolume Arena")?;
+    /// // These both work:
+    /// // - "Resolume Arena" (matches name)
+    /// // - "Simple Server" (matches app_name, since name is empty)
+    /// let client = SyphonClient::connect("Simple Server")?;
     /// if let Some(frame) = client.receive_frame()? {
     ///     // Use frame...
     /// }
@@ -215,16 +278,29 @@ impl SyphonClient {
                         "SyphonClient class not found".to_string()
                     ))?;
                 
-                // Create the client
-                let obj: *mut Object = msg_send![cls, alloc];
-                let obj: *mut Object = msg_send![
-                    obj,
-                    initWithServerDescription: server_desc
-                    options: std::ptr::null_mut::<Object>()
-                    newFrameHandler: std::ptr::null_mut::<Object>()
-                ];
+                // Create the client with Rust-level panic catching
+                let create_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let obj: *mut Object = msg_send![cls, alloc];
+                    let obj: *mut Object = msg_send![
+                        obj,
+                        initWithServerDescription: server_desc
+                        options: std::ptr::null_mut::<Object>()
+                        newFrameHandler: std::ptr::null_mut::<Object>()
+                    ];
+                    obj
+                }));
                 
                 let _: () = msg_send![server_desc, release];
+                
+                let obj = match create_result {
+                    Ok(obj) => obj,
+                    Err(_) => {
+                        log::error!("SyphonClient init panicked (likely threw Objective-C exception)");
+                        return Err(SyphonError::CreateFailed(
+                            "SyphonClient initialization failed - server may be invalid".to_string()
+                        ));
+                    }
+                };
                 
                 if obj.is_null() {
                     return Err(SyphonError::CreateFailed(
@@ -296,13 +372,13 @@ impl SyphonClient {
             }
             
             // Get dimensions from IOSurface
-            use crate::iosurface_ext::{IOSurfaceGetHeight, IOSurfaceGetBytesPerRow};
+            use crate::iosurface_ext::{IOSurfaceGetHeight, IOSurfaceGetBytesPerRow, IOSurfaceGetWidth};
             let height = IOSurfaceGetHeight(surface as io_surface::IOSurfaceRef);
             let bytes_per_row = IOSurfaceGetBytesPerRow(surface as io_surface::IOSurfaceRef);
-            // Assume 4 bytes per pixel (BGRA)
-            let width = (bytes_per_row / 4) as usize;
+            // Try to get actual width, fallback to bytes_per_row/4
+            let width = IOSurfaceGetWidth(surface as io_surface::IOSurfaceRef).max(bytes_per_row / 4);
             
-            log::debug!("Got IOSurface: {}x{}", width, height);
+            log::trace!("Got IOSurface: {}x{} (stride={} bytes)", width, height, bytes_per_row);
             
             // Retain the surface (we'll own it)
             let _: () = msg_send![surface, retain];

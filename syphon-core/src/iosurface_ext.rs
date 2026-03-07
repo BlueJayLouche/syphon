@@ -38,6 +38,9 @@ extern "C" {
     
     /// Get the height of the IOSurface
     pub fn IOSurfaceGetHeight(buffer: IOSurfaceRef) -> usize;
+    
+    /// Get the width of the IOSurface
+    pub fn IOSurfaceGetWidth(buffer: IOSurfaceRef) -> usize;
 }
 
 // Constants for lock options

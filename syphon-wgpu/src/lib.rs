@@ -1,42 +1,59 @@
 //! # Syphon wgpu Integration - Zero-Copy Edition
 //! 
-//! High-performance, zero-copy GPU-to-GPU Syphon output for wgpu applications.
+//! High-performance, zero-copy GPU-to-GPU Syphon integration for wgpu applications.
 //! 
 //! ## Overview
 //! 
-//! This crate provides a `SyphonWgpuOutput` that enables publishing wgpu-rendered
-//! frames to Syphon clients without CPU readback, using IOSurface-backed textures
-//! and Metal compute shaders for efficient Y-flip coordinate system conversion.
+//! This crate provides:
+//! - `SyphonWgpuOutput` - Publish wgpu-rendered frames to Syphon clients
+//! - `SyphonWgpuInput` - Receive frames from Syphon servers as wgpu textures
+//! 
+//! Both use IOSurface-backed textures and Metal compute shaders for zero-copy
+//! GPU transfer and efficient format conversion.
 //! 
 //! ## Coordinate System Handling
 //! 
 //! wgpu uses **top-left origin** (0,0) while Metal/Syphon use **bottom-left origin** (0,0).
-//! This crate automatically handles the Y-flip using a Metal compute shader that:
-//! - Runs in a single GPU dispatch (not row-by-row blits)
-//! - Processes all pixels in parallel via 16x16 threadgroups
-//! - Maintains full 60fps performance at high resolutions
-//! 
-//! You don't need to handle orientation - it's automatic.
+//! This crate automatically handles the Y-flip using Metal compute shaders.
 //! 
 //! ## Usage
 //! 
+//! ### Output (Server)
 //! ```no_run
 //! use syphon_wgpu::SyphonWgpuOutput;
 //! 
-//! // Create the output
 //! let mut output = SyphonWgpuOutput::new(
-//!     "My App",
-//!     &device,
-//!     &queue,
-//!     1920,
-//!     1080
+//!     "My App", &device, &queue, 1920, 1080
 //! ).expect("Failed to create Syphon output");
 //! 
-//! // Each frame, publish your rendered texture
 //! output.publish(&render_texture, &device, &queue);
 //! ```
+//!
+//! ### Input (Client)
+//! ```no_run
+//! use syphon_wgpu::SyphonWgpuInput;
+//!
+//! let mut input = SyphonWgpuInput::new(&device, &queue);
+//! input.connect("Simple Server").unwrap();
+//!
+//! if let Some(texture) = input.receive_texture(&device, &queue) {
+//!     // Use texture in your render pipeline
+//! }
+//! ```
 
-pub use syphon_core::{SyphonServer, SyphonError, Result};
+pub use syphon_core::{SyphonServer, SyphonClient, SyphonError, Result, ServerInfo};
+
+// Input module for receiving frames
+pub mod input;
+pub use input::{SyphonWgpuInput, InputFormat};
+
+// Fast input with optimized GPU upload (buffer pooling, direct texture write)
+pub mod input_fast;
+pub use input_fast::SyphonWgpuInputFast;
+
+// Optimized input with zero-copy IOSurface support (experimental)
+pub mod input_optimized;
+pub use input_optimized::SyphonWgpuInputOptimized;
 
 #[cfg(target_os = "macos")]
 use metal::*;
