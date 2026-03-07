@@ -39,12 +39,22 @@ mod server;
 mod client;
 mod directory;
 mod utils;
+mod metal_device;
 
 pub use error::{SyphonError, Result};
 pub use server::SyphonServer;
 pub use client::{SyphonClient, Frame};
 pub use directory::{SyphonServerDirectory, ServerInfo};
 pub use utils::{to_nsstring, from_nsstring, class_exists};
+pub use metal_device::{
+    MetalDeviceInfo,
+    default_device,
+    available_devices,
+    recommended_high_performance_device,
+    check_device_compatibility,
+    validate_device_match,
+    get_device_info,
+};
 
 /// Check if Syphon is available on this system
 pub fn is_available() -> bool {
