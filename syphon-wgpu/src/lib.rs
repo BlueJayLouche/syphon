@@ -36,7 +36,7 @@
 //! output.publish(&render_texture, &device, &queue);
 //! ```
 
-use syphon_core::{SyphonServer, SyphonError, Result};
+pub use syphon_core::{SyphonServer, SyphonError, Result};
 
 #[cfg(target_os = "macos")]
 use metal::*;
