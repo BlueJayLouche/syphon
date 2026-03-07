@@ -287,33 +287,22 @@ impl SyphonClient {
                 return Ok(None);
             }
             
-            // Get the frame
-            let frame: *mut Object = msg_send![
-                &*self.inner,
-                newFrameImage
-            ];
-            
-            if frame.is_null() {
-                return Ok(None);
-            }
-            
-            // Get the IOSurface from the frame
-            let surface: *mut Object = msg_send![
-                frame,
-                IOSurface
-            ];
+            // Get IOSurface directly using newSurface (private but available)
+            // This avoids needing to deal with SyphonOpenGLImage
+            let surface: *mut Object = msg_send![&*self.inner, newSurface];
             
             if surface.is_null() {
-                let _: () = msg_send![frame, release];
-                return Err(SyphonError::InvalidFrame);
+                return Ok(None);
             }
             
             // Get dimensions from IOSurface
             use crate::iosurface_ext::{IOSurfaceGetHeight, IOSurfaceGetBytesPerRow};
             let height = IOSurfaceGetHeight(surface as io_surface::IOSurfaceRef);
-            // Use bytes per row to infer width (assuming 4 bytes per pixel BGRA)
-            let stride = IOSurfaceGetBytesPerRow(surface as io_surface::IOSurfaceRef);
-            let width = (stride / 4) as u32;
+            let bytes_per_row = IOSurfaceGetBytesPerRow(surface as io_surface::IOSurfaceRef);
+            // Assume 4 bytes per pixel (BGRA)
+            let width = (bytes_per_row / 4) as usize;
+            
+            log::debug!("Got IOSurface: {}x{}", width, height);
             
             // Retain the surface (we'll own it)
             let _: () = msg_send![surface, retain];
@@ -323,12 +312,9 @@ impl SyphonClient {
                 surface as io_surface::IOSurfaceRef
             );
             
-            // Release the frame object
-            let _: () = msg_send![frame, release];
-            
             Ok(Some(Frame {
                 surface,
-                width,
+                width: width as u32,
                 height: height as u32,
             }))
         }
