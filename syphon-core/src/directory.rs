@@ -1,6 +1,4 @@
 //! Syphon Server Directory - Lists available Syphon servers
-//!
-//! This wraps the Objective-C SyphonServerDirectory class
 
 use crate::{Result, SyphonError};
 
@@ -23,17 +21,6 @@ pub struct ServerInfo {
 }
 
 /// The Syphon server directory - lists all available servers
-///
-/// # Example
-///
-/// ```no_run
-/// use syphon_core::SyphonServerDirectory;
-///
-/// let servers = SyphonServerDirectory::servers();
-/// for server in servers {
-///     println!("{} from {}", server.name, server.app_name);
-/// }
-/// ```
 pub struct SyphonServerDirectory;
 
 impl SyphonServerDirectory {
@@ -62,53 +49,79 @@ impl SyphonServerDirectory {
     #[cfg(target_os = "macos")]
     fn servers_macos() -> Vec<ServerInfo> {
         use crate::utils::from_nsstring;
+        use objc::rc::autoreleasepool;
+        use std::thread;
+        use std::time::Duration;
         
         unsafe {
-            let dir = Self::shared_directory();
-            
-            // Get the servers array
-            let servers: *mut Object = msg_send![dir, servers];
-            let count: usize = msg_send![servers, count];
-            
-            let mut result = Vec::with_capacity(count);
-            
-            for i in 0..count {
-                let server_desc: *mut Object = msg_send![servers, objectAtIndex:i];
+            autoreleasepool(|| {
+                // Get the shared directory
+                let dir = Self::shared_directory();
                 
-                // Extract values from the dictionary
-                // Keys are defined in Syphon.h as:
-                // - SyphonServerDescriptionNameKey
-                // - SyphonServerDescriptionUUIDKey  
-                // - SyphonServerDescriptionAppNameKey
+                // Request servers to announce themselves
+                let _: () = msg_send![dir, requestServerAnnounce];
                 
-                let name = Self::string_for_key(server_desc, "SyphonServerDescriptionNameKey");
-                let uuid = Self::string_for_key(server_desc, "SyphonServerDescriptionUUIDKey");
-                let app = Self::string_for_key(server_desc, "SyphonServerDescriptionAppNameKey");
-                let bundle = Self::string_for_key(server_desc, "SyphonServerDescriptionAppBundleIdentifierKey");
+                // Wait for announcements with run loop processing
+                let mut count = 0;
+                for attempt in 0..30 {
+                    // Process run loop to receive distributed notifications
+                    let run_loop: *mut Object = msg_send![Class::get("NSRunLoop").unwrap(), currentRunLoop];
+                    let date: *mut Object = msg_send![Class::get("NSDate").unwrap(), dateWithTimeIntervalSinceNow:0.05];
+                    let _: () = msg_send![run_loop, runUntilDate:date];
+                    
+                    thread::sleep(Duration::from_millis(50));
+                    
+                    let servers: *mut Object = msg_send![dir, servers];
+                    count = msg_send![servers, count];
+                    
+                    println!("Attempt {}: {} servers", attempt, count);
+                    
+                    if count > 0 {
+                        break;
+                    }
+                }
                 
-                result.push(ServerInfo {
-                    name,
-                    uuid,
-                    app_name: app,
-                    bundle_id: bundle,
-                });
-            }
-            
-            result
+                // Get the final servers array
+                let servers: *mut Object = msg_send![dir, servers];
+                count = msg_send![servers, count];
+                
+                let mut result = Vec::with_capacity(count);
+                
+                for i in 0..count {
+                    let server_desc: *mut Object = msg_send![servers, objectAtIndex:i];
+                    
+                    // Extract values using valueForKey: (KVC)
+                    let name = Self::value_for_key(server_desc, "name");
+                    let uuid = Self::value_for_key(server_desc, "uuid");
+                    let app = Self::value_for_key(server_desc, "appName");
+                    let bundle = Self::value_for_key(server_desc, "bundleIdentifier");
+                    
+                    result.push(ServerInfo {
+                        name,
+                        uuid,
+                        app_name: app,
+                        bundle_id: bundle,
+                    });
+                }
+                
+                result
+            })
         }
     }
     
-    /// Helper to get a string value from the server description dictionary
+    /// Get a value using KVC valueForKey:
     #[cfg(target_os = "macos")]
-    unsafe fn string_for_key(dict: *mut Object, key: &str) -> String {
+    unsafe fn value_for_key(dict: *mut Object, key: &str) -> String {
         use crate::utils::{to_nsstring, from_nsstring};
         
-        let key_obj = to_nsstring(key).unwrap_or(std::ptr::null_mut());
-        let value: *mut Object = msg_send![dict, objectForKey:key_obj];
+        let key_obj = match to_nsstring(key) {
+            Ok(k) => k,
+            Err(_) => return String::new(),
+        };
         
-        if !key_obj.is_null() {
-            let _: () = msg_send![key_obj, release];
-        }
+        let value: *mut Object = msg_send![dict, valueForKey:key_obj];
+        
+        // key_obj is autoreleased, don't release it
         
         if value.is_null() {
             String::new()
@@ -126,14 +139,6 @@ impl SyphonServerDirectory {
     pub fn find_server(name: &str) -> Option<ServerInfo> {
         Self::servers().into_iter().find(|s| s.name == name)
     }
-    
-    /// Get all servers from a specific application
-    pub fn servers_from_app(app_name: &str) -> Vec<ServerInfo> {
-        Self::servers()
-            .into_iter()
-            .filter(|s| s.app_name == app_name)
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -145,7 +150,7 @@ mod tests {
         let servers = SyphonServerDirectory::servers();
         println!("Found {} Syphon servers", servers.len());
         
-        for server in servers {
+        for server in &servers {
             println!("  - {} ({} from {})", 
                 server.name, 
                 server.uuid,
@@ -154,3 +159,5 @@ mod tests {
         }
     }
 }
+
+
