@@ -164,11 +164,12 @@ impl SyphonServerDirectory {
                 for i in 0..count {
                     let server_desc: *mut Object = msg_send![servers, objectAtIndex:i];
                     
-                    // Extract values using valueForKey: (KVC)
-                    let name = Self::value_for_key(server_desc, "name");
-                    let uuid = Self::value_for_key(server_desc, "uuid");
-                    let app = Self::value_for_key(server_desc, "appName");
-                    let bundle = Self::value_for_key(server_desc, "bundleIdentifier");
+                    // Extract values using objectForKey: with full Syphon constant names
+                    // Note: KVC (valueForKey:) doesn't work with these keys
+                    let name = Self::string_for_key(server_desc, "SyphonServerDescriptionNameKey");
+                    let uuid = Self::string_for_key(server_desc, "SyphonServerDescriptionUUIDKey");
+                    let app = Self::string_for_key(server_desc, "SyphonServerDescriptionAppNameKey");
+                    let bundle = Self::string_for_key(server_desc, "SyphonServerDescriptionAppBundleIdentifierKey");
                     
                     result.push(ServerInfo {
                         name,
@@ -183,9 +184,9 @@ impl SyphonServerDirectory {
         }
     }
     
-    /// Get a value using KVC valueForKey:
+    /// Get a string value using objectForKey: with the full key name
     #[cfg(target_os = "macos")]
-    unsafe fn value_for_key(dict: *mut Object, key: &str) -> String {
+    unsafe fn string_for_key(dict: *mut Object, key: &str) -> String {
         use crate::utils::{to_nsstring, from_nsstring};
         
         let key_obj = match to_nsstring(key) {
@@ -193,7 +194,7 @@ impl SyphonServerDirectory {
             Err(_) => return String::new(),
         };
         
-        let value: *mut Object = msg_send![dict, valueForKey:key_obj];
+        let value: *mut Object = msg_send![dict, objectForKey:key_obj];
         
         // key_obj is autoreleased, don't release it
         
