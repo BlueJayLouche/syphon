@@ -317,11 +317,14 @@ impl FastBgraToRgbaConverter {
 
     fn ensure_buffers(&mut self, width: u32, height: u32, input_size: u64) {
         // Check if we need to recreate buffers
+        // Note: output_texture can be None if it was taken in a previous frame
         let needs_resize = self.current_width != width 
             || self.current_height != height
-            || self.input_buffer.is_none();
+            || self.input_buffer.is_none()
+            || self.output_texture.is_none();
 
         if needs_resize {
+            log::trace!("[FastBgraToRgbaConverter] Recreating buffers: {}x{}", width, height);
             // Create input buffer with exact size needed
             self.input_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Fast BGRA Input Pool"),
