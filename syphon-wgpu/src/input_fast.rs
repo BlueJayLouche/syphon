@@ -227,8 +227,8 @@ impl FastBgraToRgbaConverter {
                 }}
 
                 // Calculate source index (accounting for stride)
-                let src_y = uniforms.height - 1 - coords.y; // Y-flip
-                let src_idx = src_y * (uniforms.stride / 4u) + coords.x;
+                // Note: No Y-flip on client side - server handles coordinate system
+                let src_idx = coords.y * (uniforms.stride / 4u) + coords.x;
 
                 // Load BGRA pixel
                 let bgra = input_buffer[src_idx];

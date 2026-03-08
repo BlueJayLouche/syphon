@@ -205,44 +205,15 @@ impl SyphonWgpuInput {
     #[cfg(target_os = "macos")]
     fn create_texture_from_iosurface(
         &self,
-        device: &wgpu::Device,
-        frame: &syphon_core::Frame,
-        width: u32,
-        height: u32,
+        _device: &wgpu::Device,
+        _frame: &syphon_core::Frame,
+        _width: u32,
+        _height: u32,
     ) -> Option<wgpu::Texture> {
-        use wgpu::hal::metal::Device as HalMetalDevice;
-
-        unsafe {
-            // Get the IOSurface from the frame
-            let iosurface = frame.iosurface();
-            let surface_ref = iosurface.as_CFTypeRef() as IOSurfaceRef;
-
-            // Create wgpu texture from IOSurface via Metal interop
-            let mut texture_opt: Option<wgpu::Texture> = None;
-
-            device.as_hal::<wgpu_hal::api::Metal, _, _>(|hal_device| {
-                if let Some(dev) = hal_device {
-                    // Create Metal texture from IOSurface
-                    let mtl_texture = create_metal_texture_from_iosurface(
-                        &dev.raw_device().lock(),
-                        surface_ref,
-                        width,
-                        height,
-                    );
-
-                    if let Some(mtl_tex) = mtl_texture {
-                        // Create wgpu texture from Metal texture
-                        // This is a placeholder - actual implementation would use wgpu-hal's
-                        // from_raw functionality or similar
-                        log::trace!("[SyphonWgpuInput] Created zero-copy IOSurface texture");
-                        // texture_opt = Some(wgpu::Texture::from_hal(...));
-                    }
-                }
-            });
-
-            // Fall back to copy path if zero-copy failed
-            texture_opt
-        }
+        // TODO: Implement true zero-copy IOSurface→wgpu texture interop
+        // This requires wgpu-hal support for creating textures from raw Metal handles
+        // For now, fall back to copy path
+        None
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -583,5 +554,22 @@ impl BgraConverter {
         queue.submit(std::iter::once(encoder.finish()));
 
         Some(texture)
+    }
+}
+
+/// Get Metal device from wgpu device
+#[cfg(target_os = "macos")]
+fn get_metal_device(wgpu_device: &wgpu::Device) -> Option<metal::Device> {
+    use wgpu::hal::metal::Device as HalMetalDevice;
+    
+    unsafe {
+        let mut device_opt: Option<metal::Device> = None;
+        wgpu_device.as_hal::<wgpu_hal::api::Metal, _, _>(|hal_device| {
+            if let Some(dev) = hal_device {
+                let raw = dev.raw_device().lock();
+                device_opt = Some(raw.clone());
+            }
+        });
+        device_opt
     }
 }
