@@ -371,8 +371,18 @@ impl SyphonClient {
                 return Ok(None);
             }
             
-            // Get IOSurface directly using newSurface (private but available)
-            // This avoids needing to deal with SyphonOpenGLImage
+            // For SyphonMetalClient, we must call newFrameImage to consume the frame
+            // and reset the hasNewFrame flag. We get the texture and immediately release it
+            // since we only need the IOSurface from the underlying frame.
+            let texture: *mut Object = msg_send![&*self.inner, newFrameImage];
+            if texture.is_null() {
+                return Ok(None);
+            }
+            
+            // Release the texture - we don't need it, we just needed to consume the frame
+            let _: () = msg_send![texture, release];
+            
+            // Now get the IOSurface directly using newSurface (private but available)
             let surface: *mut Object = msg_send![&*self.inner, newSurface];
             
             if surface.is_null() {
