@@ -118,7 +118,15 @@ impl SyphonWgpuInputFast {
 
         // Get BGRA data from IOSurface
         let bgra_data = match frame.to_vec() {
-            Ok(data) => data,
+            Ok(data) => {
+                // Debug: Check if data is all zeros (black)
+                let sum: u64 = data.iter().map(|&b| b as u64).sum();
+                log::trace!("[SyphonWgpuInputFast] Frame data: {} bytes, sum={}", data.len(), sum);
+                if sum == 0 {
+                    log::warn!("[SyphonWgpuInputFast] Frame data is all zeros (black)!");
+                }
+                data
+            }
             Err(e) => {
                 log::warn!("[SyphonWgpuInputFast] Failed to read frame: {}", e);
                 return None;
@@ -415,8 +423,15 @@ impl FastBgraToRgbaConverter {
         }
 
         queue.submit(std::iter::once(encoder.finish()));
+        
+        // CRITICAL: Wait for compute shader to finish before returning texture
+        // Otherwise the texture may be used before the GPU writes are complete
+        if let Err(e) = self.device.poll(wgpu::PollType::Wait) {
+            log::warn!("[SyphonWgpuInputFast] Poll failed: {:?}", e);
+        }
 
         // Return the output texture
+        log::trace!("[SyphonWgpuInputFast] Returning texture {}x{}", width, height);
         Some(self.output_texture.take().unwrap())
     }
 }
