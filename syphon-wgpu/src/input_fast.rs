@@ -102,8 +102,18 @@ impl SyphonWgpuInputFast {
 
         // Try to receive frame from Syphon
         let mut frame = match client.try_receive() {
-            Ok(Some(frame)) => frame,
-            _ => return None,
+            Ok(Some(frame)) => {
+                log::trace!("[SyphonWgpuInputFast] Received frame {}x{}", frame.width, frame.height);
+                frame
+            }
+            Ok(None) => {
+                // No new frame available - this is normal, don't spam logs
+                return None;
+            }
+            Err(e) => {
+                log::warn!("[SyphonWgpuInputFast] Error receiving frame: {}", e);
+                return None;
+            }
         };
 
         // Get BGRA data from IOSurface

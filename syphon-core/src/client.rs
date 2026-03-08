@@ -371,22 +371,23 @@ impl SyphonClient {
                 return Ok(None);
             }
             
-            // For SyphonMetalClient, we must call newFrameImage to consume the frame
-            // and reset the hasNewFrame flag. We get the texture and immediately release it
-            // since we only need the IOSurface from the underlying frame.
-            let texture: *mut Object = msg_send![&*self.inner, newFrameImage];
-            if texture.is_null() {
-                return Ok(None);
-            }
-            
-            // Release the texture - we don't need it, we just needed to consume the frame
-            let _: () = msg_send![texture, release];
-            
-            // Now get the IOSurface directly using newSurface (private but available)
+            // Get the IOSurface first (before consuming the frame)
+            // newSurface returns the same IOSurface that will be used for the texture
             let surface: *mut Object = msg_send![&*self.inner, newSurface];
             
             if surface.is_null() {
                 return Ok(None);
+            }
+            
+            // Retain the surface immediately (we'll own it)
+            let _: () = msg_send![surface, retain];
+            
+            // For SyphonMetalClient, we must call newFrameImage to consume the frame
+            // and reset the hasNewFrame flag. This returns a texture that wraps the IOSurface.
+            let texture: *mut Object = msg_send![&*self.inner, newFrameImage];
+            if !texture.is_null() {
+                // Release the texture - we don't need it since we already retained the surface
+                let _: () = msg_send![texture, release];
             }
             
             // Get dimensions from IOSurface
@@ -398,10 +399,7 @@ impl SyphonClient {
             
             log::trace!("Got IOSurface: {}x{} (stride={} bytes)", width, height, bytes_per_row);
             
-            // Retain the surface (we'll own it)
-            let _: () = msg_send![surface, retain];
-            
-            // Wrap in IOSurface struct
+            // Wrap in IOSurface struct (we already retained it above)
             let surface = io_surface::IOSurface::wrap_under_get_rule(
                 surface as io_surface::IOSurfaceRef
             );
