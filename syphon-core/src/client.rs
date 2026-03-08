@@ -264,18 +264,24 @@ impl SyphonClient {
                         server_name.to_string()
                     ));
                 }
-                let _: () = msg_send![server_desc, retain];
                 
-                // Get server info
+                // Get server info before we potentially move the description
                 let name = Self::get_string_from_desc(server_desc, "SyphonServerDescriptionNameKey");
                 let app = Self::get_string_from_desc(server_desc, "SyphonServerDescriptionAppNameKey");
                 
                 log::info!("Connecting to server: '{}' from '{}'", name, app);
                 
-                // Get SyphonClient class
-                let cls = Class::get("SyphonClient")
+                // Get the default Metal device
+                let device = crate::metal_device::default_device()
+                    .map(|info| info.raw_device)
                     .ok_or_else(|| SyphonError::FrameworkNotFound(
-                        "SyphonClient class not found".to_string()
+                        "Metal not available - cannot create Syphon client".to_string()
+                    ))?;
+                
+                // Get SyphonMetalClient class (Metal client is easier to set up than OpenGL)
+                let cls = Class::get("SyphonMetalClient")
+                    .ok_or_else(|| SyphonError::FrameworkNotFound(
+                        "SyphonMetalClient class not found".to_string()
                     ))?;
                 
                 // Create the client with Rust-level panic catching
@@ -284,20 +290,22 @@ impl SyphonClient {
                     let obj: *mut Object = msg_send![
                         obj,
                         initWithServerDescription: server_desc
+                        device: device
                         options: std::ptr::null_mut::<Object>()
                         newFrameHandler: std::ptr::null_mut::<Object>()
                     ];
                     obj
                 }));
                 
+                // Release the server description (we retained it when we found it)
                 let _: () = msg_send![server_desc, release];
                 
                 let obj = match create_result {
                     Ok(obj) => obj,
                     Err(_) => {
-                        log::error!("SyphonClient init panicked (likely threw Objective-C exception)");
+                        log::error!("SyphonMetalClient init panicked (likely threw Objective-C exception)");
                         return Err(SyphonError::CreateFailed(
-                            "SyphonClient initialization failed - server may be invalid".to_string()
+                            "SyphonMetalClient initialization failed - server may be invalid".to_string()
                         ));
                     }
                 };
