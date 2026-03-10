@@ -5,6 +5,7 @@
 //! - Direct texture upload (no intermediate buffer copy)
 //! - Optimized compute dispatch for Apple Silicon
 
+use crate::input::InputFormat;
 use syphon_core::{SyphonClient, SyphonError, Result};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -20,6 +21,7 @@ pub struct SyphonWgpuInputFast {
     client: Option<SyphonClient>,
     device: Option<Arc<wgpu::Device>>,
     queue: Option<Arc<wgpu::Queue>>,
+    format: InputFormat,
     converter: Option<FastBgraToRgbaConverter>,
     connected_server: Option<String>,
     frame_count: u64,
@@ -49,6 +51,7 @@ impl SyphonWgpuInputFast {
             client: None,
             device: Some(Arc::new(device.clone())),
             queue: Some(Arc::new(queue.clone())),
+            format: InputFormat::Rgba, // Default to RGBA for backward compatibility
             converter: None,
             connected_server: None,
             frame_count: 0,
@@ -82,6 +85,22 @@ impl SyphonWgpuInputFast {
         self.connected_server = None;
         self.frame_count = 0;
         log::info!("[SyphonWgpuInputFast] Disconnected");
+    }
+
+    /// Set the output format
+    ///
+    /// # Arguments
+    /// * `format` - The desired output format (BGRA or RGBA)
+    ///
+    /// Must be called before `connect()` to take effect.
+    pub fn set_format(&mut self, format: InputFormat) {
+        self.format = format;
+        log::info!("[SyphonWgpuInputFast] Output format set to: {:?}", format);
+    }
+
+    /// Get the current output format
+    pub fn format(&self) -> InputFormat {
+        self.format
     }
 
     /// Check if connected to a server
@@ -147,8 +166,70 @@ impl SyphonWgpuInputFast {
             self.last_frame_time = now;
         }
 
-        // Convert to RGBA texture using fast path
-        converter.convert(&bgra_data, width, height, device, queue)
+        // Process based on format
+        match self.format {
+            InputFormat::Rgba => {
+                // Convert BGRA to RGBA using compute shader
+                converter.convert(&bgra_data, width, height, device, queue)
+            }
+            InputFormat::Bgra => {
+                // Direct BGRA upload - no conversion needed
+                self.create_bgra_texture_from_data(device, queue, &bgra_data, width, height)
+            }
+        }
+    }
+
+    /// Create BGRA texture directly from frame data (zero conversion path)
+    fn create_bgra_texture_from_data(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bgra_data: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Option<wgpu::Texture> {
+        let stride = bgra_data.len() as u32 / height;
+
+        // Create BGRA texture
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Syphon BGRA Texture (Fast)"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        // Upload data directly
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bgra_data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        Some(texture)
     }
 
     /// Get connected server name
