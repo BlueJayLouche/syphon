@@ -8,14 +8,14 @@
 //! - `SyphonWgpuOutput` - Publish wgpu-rendered frames to Syphon clients
 //! - `SyphonWgpuInput` - Receive frames from Syphon servers as wgpu textures
 //! 
-//! Both use IOSurface-backed textures and Metal compute shaders for zero-copy
-//! GPU transfer and efficient format conversion.
+//! Both use IOSurface-backed textures for zero-copy GPU transfer.
 //! 
-//! ## Coordinate System Handling
+//! ## Native BGRA Format
 //! 
-//! wgpu uses **top-left origin** (0,0) while Metal/Syphon use **bottom-left origin** (0,0).
-//! This crate automatically handles the Y-flip using Metal compute shaders.
-//! 
+//! This crate uses native macOS BGRA8Unorm format throughout. When rendering for Syphon output,
+//! use `wgpu::TextureFormat::Bgra8Unorm`. When receiving from Syphon, you'll get BGRA data
+//! directly without any format conversion.
+//!
 //! ## Usage
 //! 
 //! ### Output (Server)
@@ -37,7 +37,7 @@
 //! input.connect("Simple Server").unwrap();
 //!
 //! if let Some(texture) = input.receive_texture(&device, &queue) {
-//!     // Use texture in your render pipeline
+//!     // Texture is Bgra8Unorm (native Syphon format)
 //! }
 //! ```
 
@@ -45,15 +45,7 @@ pub use syphon_core::{SyphonServer, SyphonClient, SyphonError, Result, ServerInf
 
 // Input module for receiving frames
 pub mod input;
-pub use input::{SyphonWgpuInput, InputFormat};
-
-// Fast input with optimized GPU upload (buffer pooling, direct texture write)
-pub mod input_fast;
-pub use input_fast::SyphonWgpuInputFast;
-
-// Optimized input with zero-copy IOSurface support (experimental)
-pub mod input_optimized;
-pub use input_optimized::SyphonWgpuInputOptimized;
+pub use input::SyphonWgpuInput;
 
 #[cfg(target_os = "macos")]
 use metal::*;
@@ -62,50 +54,21 @@ use metal::foreign_types::{ForeignType, ForeignTypeRef};
 #[cfg(target_os = "macos")]
 use objc::runtime::Object;
 #[cfg(target_os = "macos")]
-use objc::{msg_send, class, sel, sel_impl};
+use objc::{msg_send, sel, sel_impl};
 #[cfg(target_os = "macos")]
 use cocoa::foundation::NSUInteger;
 #[cfg(target_os = "macos")]
 use core_foundation::base::TCFType;
 
-/// Metal compute shader source for Y-flip
-/// 
-/// This is more efficient than row-by-row blit commands.
-/// Uses 16x16 threadgroups for good GPU utilization.
-#[cfg(target_os = "macos")]
-const FLIP_COMPUTE_SHADER: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void flip_y(
-    texture2d<float, access::read> src_texture [[texture(0)]],
-    texture2d<float, access::write> dst_texture [[texture(1)]],
-    uint2 gid [[thread_position_in_grid]]
-) {
-    // Bounds check
-    if (gid.x >= src_texture.get_width() || gid.y >= src_texture.get_height()) {
-        return;
-    }
-    
-    uint height = src_texture.get_height();
-    uint2 src_coord = gid;
-    uint2 dst_coord = uint2(gid.x, height - 1 - gid.y);
-    
-    float4 color = src_texture.read(src_coord);
-    dst_texture.write(color, dst_coord);
-}
-"#;
-
 /// High-level wgpu-to-Syphon output with zero-copy GPU transfer
 /// 
-/// This implementation uses IOSurface-backed textures and Metal compute shaders
-/// to transfer frames directly from wgpu to Syphon without CPU readback.
+/// This implementation uses IOSurface-backed textures to transfer frames directly
+/// from wgpu to Syphon without CPU readback.
 /// 
-/// ## Coordinate System Handling
+/// ## Format
 /// 
-/// wgpu uses top-left origin (0,0) while Metal/Syphon use bottom-left origin (0,0).
-/// This struct automatically handles the Y-flip using a Metal compute shader
-/// that runs in a single GPU dispatch for optimal performance.
+/// Uses native BGRA8Unorm format. Render your content to a Bgra8Unorm texture
+/// and publish it directly.
 pub struct SyphonWgpuOutput {
     server: SyphonServer,
     width: u32,
@@ -117,13 +80,9 @@ pub struct SyphonWgpuOutput {
     #[cfg(target_os = "macos")]
     use_zero_copy: bool,
     #[cfg(target_os = "macos")]
-    // Fallback to CPU readback if zero-copy fails
     metal_device: Option<Device>,
     #[cfg(target_os = "macos")]
     metal_queue: Option<CommandQueue>,
-    #[cfg(target_os = "macos")]
-    // Compute pipeline for Y-flip (more efficient than row-by-row blit)
-    compute_pipeline: Option<metal::ComputePipelineState>,
 }
 
 #[cfg(target_os = "macos")]
@@ -146,18 +105,18 @@ impl SyphonWgpuOutput {
     pub fn new(
         name: &str,
         wgpu_device: &wgpu::Device,
-        wgpu_queue: &wgpu::Queue,
+        _wgpu_queue: &wgpu::Queue,
         width: u32,
         height: u32,
     ) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
-            Self::new_macos(name, wgpu_device, wgpu_queue, width, height)
+            Self::new_macos(name, wgpu_device, _wgpu_queue, width, height)
         }
         
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (name, wgpu_device, wgpu_queue, width, height);
+            let _ = (name, wgpu_device, _wgpu_queue, width, height);
             Err(SyphonError::NotAvailable)
         }
     }
@@ -171,38 +130,27 @@ impl SyphonWgpuOutput {
         height: u32,
     ) -> Result<Self> {
         // Try to get the Metal device from wgpu for zero-copy
-        let metal_device = unsafe {
-            use wgpu::hal::metal::Device as HalMetalDevice;
-            
-            let mut device_opt: Option<metal::Device> = None;
+        let mut device_opt: Option<metal::Device> = None;
+        unsafe {
             wgpu_device.as_hal::<wgpu_hal::api::Metal, _, _>(|hal_device| {
                 if let Some(dev) = hal_device {
                     let raw = dev.raw_device().lock();
                     device_opt = Some(raw.clone());
                 }
             });
-            device_opt
-        };
+        }
         
-        let use_zero_copy = metal_device.is_some();
+        let use_zero_copy = device_opt.is_some();
         
         if use_zero_copy {
             log::info!("SyphonWgpuOutput: Using zero-copy GPU-to-GPU path");
             
-            let metal_device = metal_device.unwrap();
+            let metal_device = device_opt.unwrap();
             let metal_queue = metal_device.new_command_queue();
             
-            // Create compute pipeline for Y-flip (much faster than row-by-row blit)
-            let compute_pipeline = Self::create_flip_pipeline(&metal_device);
-            if compute_pipeline.is_some() {
-                log::info!("SyphonWgpuOutput: Compute flip pipeline created");
-            }
-            
             // Create the Syphon server with the Metal device
-            let server = unsafe {
-                let device_ptr = metal_device.as_ref() as *const DeviceRef as *mut Object;
-                SyphonServer::new_with_name_and_device(name, device_ptr, width, height)?
-            };
+            let device_ptr = metal_device.as_ref() as *const DeviceRef as *mut Object;
+            let server = SyphonServer::new_with_name_and_device(name, device_ptr, width, height)?;
             
             // Create an IOSurface pool for triple-buffering
             let surface_pool = syphon_metal::IOSurfacePool::new(width, height, 3);
@@ -221,7 +169,6 @@ impl SyphonWgpuOutput {
                 use_zero_copy: true,
                 metal_device: Some(metal_device),
                 metal_queue: Some(metal_queue),
-                compute_pipeline,
             })
         } else {
             log::warn!("SyphonWgpuOutput: Metal interop failed, falling back to CPU readback");
@@ -234,10 +181,8 @@ impl SyphonWgpuOutput {
             
             let metal_queue = metal_device.new_command_queue();
             
-            let server = unsafe {
-                let device_ptr = metal_device.as_ref() as *const DeviceRef as *mut Object;
-                SyphonServer::new_with_name_and_device(name, device_ptr, width, height)?
-            };
+            let device_ptr = metal_device.as_ref() as *const DeviceRef as *mut Object;
+            let server = SyphonServer::new_with_name_and_device(name, device_ptr, width, height)?;
             
             // Empty pool for fallback mode
             let surface_pool = syphon_metal::IOSurfacePool::new(width, height, 0);
@@ -253,7 +198,6 @@ impl SyphonWgpuOutput {
                 use_zero_copy: false,
                 metal_device: Some(metal_device),
                 metal_queue: Some(metal_queue),
-                compute_pipeline: None,
             })
         }
     }
@@ -262,6 +206,10 @@ impl SyphonWgpuOutput {
     /// 
     /// This performs a zero-copy GPU-to-GPU transfer if possible,
     /// falling back to CPU readback if necessary.
+    /// 
+    /// # Note
+    /// 
+    /// The texture should be in Bgra8Unorm format for best performance.
     pub fn publish(&mut self, texture: &wgpu::Texture, device: &wgpu::Device, queue: &wgpu::Queue) {
         #[cfg(target_os = "macos")]
         {
@@ -281,8 +229,6 @@ impl SyphonWgpuOutput {
     
     #[cfg(target_os = "macos")]
     fn publish_zero_copy(&mut self, texture: &wgpu::Texture, _device: &wgpu::Device, queue: &wgpu::Queue) {
-        use wgpu::hal::metal::Queue as HalMetalQueue;
-        
         // Get an IOSurface from the pool
         let surface = match self.surface_pool.acquire() {
             Some(s) => s,
@@ -293,7 +239,6 @@ impl SyphonWgpuOutput {
         };
         
         // We need to perform the blit on wgpu's queue to avoid synchronization issues
-        // This requires using wgpu-hal to access the raw Metal queue and texture
         unsafe {
             queue.as_hal::<wgpu_hal::api::Metal, _, _>(|hal_queue| {
                 if let Some(mtl_queue) = hal_queue {
@@ -318,68 +263,24 @@ impl SyphonWgpuOutput {
                                     // Create command buffer from wgpu's queue
                                     let cmd_buf = raw_queue.new_command_buffer();
                                     
-                                    // Use compute shader for Y-flip (much faster than row-by-row blit)
-                                    if let Some(ref pipeline) = self.compute_pipeline {
-                                        // Create compute encoder
-                                        let compute_encoder = cmd_buf.new_compute_command_encoder();
-                                        
-                                        // Tell Metal we're using these textures
-                                        use metal::MTLResourceUsage;
-                                        compute_encoder.use_resource(
-                                            src_texture, 
-                                            MTLResourceUsage::Read
-                                        );
-                                        compute_encoder.use_resource(
-                                            &dest_texture, 
-                                            MTLResourceUsage::Write
-                                        );
-                                        
-                                        compute_encoder.set_compute_pipeline_state(pipeline);
-                                        compute_encoder.set_texture(0, Some(src_texture));
-                                        compute_encoder.set_texture(1, Some(&dest_texture));
-                                        
-                                        // Calculate threadgroups (16x16 threads per group)
-                                        let threadgroup_width = 16u64;
-                                        let threadgroup_height = 16u64;
-                                        let threadgroups_x = (self.width as u64 + threadgroup_width - 1) / threadgroup_width;
-                                        let threadgroups_y = (self.height as u64 + threadgroup_height - 1) / threadgroup_height;
-                                        
-                                        compute_encoder.dispatch_thread_groups(
-                                            metal::MTLSize { width: threadgroups_x, height: threadgroups_y, depth: 1 },
-                                            metal::MTLSize { width: threadgroup_width, height: threadgroup_height, depth: 1 },
-                                        );
-                                        compute_encoder.end_encoding();
-                                    } else {
-                                        // Fallback: row-by-row blit with Y-flip
-                                        // Slower than compute but maintains correct orientation
-                                        log::debug!("Using row-by-row blit fallback for Y-flip");
-                                        let blit = cmd_buf.new_blit_command_encoder();
-                                        
-                                        let src_width = self.width as u64;
-                                        let src_height = self.height as u64;
-                                        
-                                        for row in 0..src_height {
-                                            let src_y = row;
-                                            let dst_y = src_height - 1 - row;
-                                            
-                                            blit.copy_from_texture(
-                                                src_texture,
-                                                0,  // source level
-                                                0,  // source slice
-                                                MTLOrigin { x: 0, y: src_y, z: 0 },
-                                                MTLSize { 
-                                                    width: src_width, 
-                                                    height: 1, 
-                                                    depth: 1 
-                                                },
-                                                &dest_texture,
-                                                0,  // dest level
-                                                0,  // dest slice
-                                                MTLOrigin { x: 0, y: dst_y, z: 0 },
-                                            );
-                                        }
-                                        blit.end_encoding();
-                                    }
+                                    // Simple blit - native BGRA
+                                    let blit = cmd_buf.new_blit_command_encoder();
+                                    blit.copy_from_texture(
+                                        src_texture,
+                                        0,  // source level
+                                        0,  // source slice
+                                        MTLOrigin { x: 0, y: 0, z: 0 },
+                                        MTLSize { 
+                                            width: self.width as u64, 
+                                            height: self.height as u64, 
+                                            depth: 1 
+                                        },
+                                        &dest_texture,
+                                        0,  // dest level
+                                        0,  // dest slice
+                                        MTLOrigin { x: 0, y: 0, z: 0 },
+                                    );
+                                    blit.end_encoding();
                                     
                                     // Publish to Syphon before committing
                                     let texture_ptr = dest_texture.as_ptr() as *mut Object;
@@ -400,41 +301,6 @@ impl SyphonWgpuOutput {
         // Note: In production, we should wait for the GPU to finish before returning
         // For now, triple-buffering gives us enough safety margin
         self.surface_pool.release(surface);
-    }
-    
-    /// Create a Metal compute pipeline for Y-flip
-    /// 
-    /// This is much more efficient than row-by-row blit commands.
-    #[cfg(target_os = "macos")]
-    fn create_flip_pipeline(device: &metal::Device) -> Option<metal::ComputePipelineState> {
-        // Compile the compute shader
-        let compile_options = metal::CompileOptions::new();
-        let library = match device.new_library_with_source(FLIP_COMPUTE_SHADER, &compile_options) {
-            Ok(lib) => lib,
-            Err(e) => {
-                log::warn!("Failed to compile compute shader library: {:?}", e);
-                return None;
-            }
-        };
-        
-        let kernel = match library.get_function("flip_y", None) {
-            Ok(k) => k,
-            Err(e) => {
-                log::warn!("Failed to get flip_y kernel: {:?}", e);
-                return None;
-            }
-        };
-        
-        match device.new_compute_pipeline_state_with_function(&kernel) {
-            Ok(pipeline) => {
-                log::info!("Compute flip pipeline created successfully");
-                Some(pipeline)
-            }
-            Err(e) => {
-                log::warn!("Failed to create compute pipeline: {:?}", e);
-                None
-            }
-        }
     }
     
     /// Create a Metal texture from an IOSurface using raw Objective-C
@@ -529,7 +395,7 @@ impl SyphonWgpuOutput {
         queue.submit(std::iter::once(encoder.finish()));
         
         // Wait for GPU
-        device.poll(wgpu::PollType::Wait);
+        let _ = device.poll(wgpu::PollType::Wait);
         
         // Map and upload
         let buffer_slice = buffer.slice(..);
@@ -548,7 +414,7 @@ impl SyphonWgpuOutput {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_micros(100));
-            device.poll(wgpu::PollType::Poll);
+            let _ = device.poll(wgpu::PollType::Poll);
         }
         
         if ready {
@@ -559,18 +425,7 @@ impl SyphonWgpuOutput {
                 if let (Some(ref metal_device), Some(ref metal_queue)) = 
                     (&self.metal_device, &self.metal_queue) 
                 {
-                    // Flip the image vertically for Metal/Syphon coordinate system
-                    // wgpu is top-left origin, Metal is bottom-left origin
-                    let bytes_per_row = self.width as usize * 4;
-                    let mut flipped_data = Vec::with_capacity(data.len());
-                    
-                    for row in (0..self.height as usize).rev() {
-                        let start = row * bytes_per_row;
-                        let end = start + bytes_per_row;
-                        flipped_data.extend_from_slice(&data[start..end]);
-                    }
-                    
-                    // Create Metal texture and upload
+                    // Upload directly without flip - native BGRA
                     let desc = TextureDescriptor::new();
                     desc.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
                     desc.set_width(self.width as u64);
@@ -590,7 +445,7 @@ impl SyphonWgpuOutput {
                             },
                         },
                         0,
-                        flipped_data.as_ptr() as *const _,
+                        data.as_ptr() as *const _,
                         (self.width * 4) as u64,
                     );
                     

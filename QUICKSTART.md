@@ -5,11 +5,12 @@ Get Syphon running in 5 minutes.
 ## 1. Install Framework
 
 ```bash
-# Download Syphon
-open https://github.com/Syphon/Syphon-Framework/releases
+# Clone with submodules (includes Syphon framework)
+git clone --recursive https://github.com/yourusername/syphon.git
+cd syphon
 
-# Copy to workspace
-cp -R ~/Downloads/Syphon.framework ../crates/syphon/syphon-lib/
+# Or if already cloned
+git submodule update --init --recursive
 ```
 
 ## 2. Add to Your Project
@@ -17,7 +18,7 @@ cp -R ~/Downloads/Syphon.framework ../crates/syphon/syphon-lib/
 **Cargo.toml:**
 ```toml
 [target.'cfg(target_os = "macos")'.dependencies]
-syphon-core = { path = "../crates/syphon/syphon-core" }
+syphon-wgpu = { path = "../crates/syphon/syphon-wgpu" }
 ```
 
 **build.rs:**
@@ -25,95 +26,122 @@ syphon-core = { path = "../crates/syphon/syphon-core" }
 fn main() {
     #[cfg(target_os = "macos")]
     {
-        println!("cargo:rustc-link-search=framework=../crates/syphon/syphon-lib");
-        println!("cargo:rustc-link-arg=-Wl,-rpath,../crates/syphon/syphon-lib");
+        println!("cargo:rustc-link-search=framework=../crates/syphon/syphon-lib/Syphon-Framework");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,../crates/syphon/syphon-lib/Syphon-Framework");
     }
 }
 ```
 
-## 3. Send Video (Server)
+## 3. Send Video from wgpu (Server)
 
 ```rust
-use syphon_core::SyphonServer;
+use syphon_wgpu::SyphonWgpuOutput;
 
-fn main() -> anyhow::Result<()> {
-    // Create server
-    let server = SyphonServer::new("My App", 1920, 1080)?;
-    
-    println!("Server running! Connect from Resolume/OBS.");
-    println!("Press Ctrl+C to stop.");
-    
-    // Keep running
-    std::thread::park();
-    Ok(())
-}
+// Create the output (BGRA8Unorm format)
+let mut output = SyphonWgpuOutput::new(
+    "My App",      // Server name visible to clients
+    &wgpu_device,  // Your wgpu device
+    &wgpu_queue,   // Your wgpu queue
+    1920,          // Width
+    1080           // Height
+).expect("Failed to create Syphon output");
+
+// Each frame, publish your rendered Bgra8Unorm texture
+output.publish(&render_texture, &wgpu_device, &wgpu_queue);
 ```
 
 ## 4. Receive Video (Client)
 
-```rust
-use syphon_core::{SyphonClient, SyphonServerDirectory};
-use std::thread;
-use std::time::Duration;
+### Zero-Copy with Metal (Recommended)
 
-fn main() -> anyhow::Result<()> {
-    // Wait for server
-    println!("Looking for servers...");
-    thread::sleep(Duration::from_secs(2));
-    
-    // List servers
-    let servers = SyphonServerDirectory::servers();
-    if servers.is_empty() {
-        println!("No servers found!");
-        return Ok(());
+```rust
+use syphon_core::SyphonClient;
+use syphon_metal::MetalContext;
+
+// Create a Metal context
+let metal_ctx = MetalContext::system_default()
+    .expect("Metal not available");
+
+// Connect to a Syphon server
+let client = SyphonClient::connect("My App")
+    .expect("Failed to connect");
+
+// Receive frames
+loop {
+    if let Ok(Some(mut frame)) = client.try_receive() {
+        // ZERO-COPY: Create Metal texture directly from IOSurface
+        let surface = frame.iosurface();
+        let texture = metal_ctx.create_texture_from_iosurface(
+            surface,
+            frame.width,
+            frame.height
+        ).expect("Failed to create texture");
+        
+        // Use texture in your Metal render pipeline
+        // Format is BGRA8Unorm
+        
+        // Texture and IOSurface are released when dropped
     }
-    
-    // Connect to first server
-    let target = &servers[0];
-    println!("Connecting to '{}'...", target.name);
-    
-    let client = SyphonClient::connect(&target.name)?;
-    
-    // Receive frames
-    loop {
-        if let Some(frame) = client.try_receive()? {
-            let data = frame.to_vec()?;
-            println!("Got frame: {}x{} ({} bytes)", 
-                frame.width, frame.height, data.len());
-        }
-        thread::sleep(Duration::from_millis(16));
-    }
+}
+```
+
+### With wgpu
+
+```rust
+use syphon_wgpu::SyphonWgpuInput;
+
+// Create input handler
+let mut input = SyphonWgpuInput::new(&device, &queue);
+
+// Connect to a server
+input.connect("My App").unwrap();
+
+// Receive frames as wgpu textures (BGRA8Unorm format)
+if let Some(texture) = input.receive_texture(&device, &queue) {
+    // Use texture in your wgpu render pipeline
 }
 ```
 
 ## 5. Test It
 
 ```bash
-# Terminal 1: Start server
-cargo run --example simple_server
+# Build the workspace
+cargo build --workspace --release
 
-# Terminal 2: Connect client
-cargo run --example simple_client
+# Run the wgpu sender example
+cargo run --example wgpu_sender --release
+
+# In another terminal, run the Metal client
+cargo run --example metal_client --release -- "WGPU Zero-Copy Test"
 ```
 
-You should see the client receiving frames from the server!
+You should see the client receiving frames from the wgpu sender!
+
+## Format
+
+This crate uses **native macOS BGRA8Unorm format** throughout:
+
+- **Output**: Render to `Bgra8Unorm` textures and publish directly
+- **Input**: Received textures are `Bgra8Unorm` (no conversion)
+
+This eliminates all format conversion overhead.
 
 ## Next Steps
 
 - [Full README](README.md) - Complete documentation
-- [Examples](syphon-examples/examples/) - More code samples
-- [Troubleshooting](TROUBLESHOOTING.md) - Fix common issues
+- [Examples](syphon-examples/examples/) - Example code
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) - Fix common issues
 
 ## One-Liners
 
 **Check if Syphon works:**
 ```bash
-cd ../crates/syphon/syphon-examples && cargo run --example simple_server
+cd ../crates/syphon && cargo run --example wgpu_sender --package syphon-examples
 ```
 
 **Check available servers:**
 ```rust
-let servers = SyphonServerDirectory::servers();
+let servers = syphon_wgpu::list_servers();
 println!("Found {} servers", servers.len());
 ```
 
@@ -129,7 +157,7 @@ for gpu in available_devices() {
 
 | Error | Solution |
 |-------|----------|
-| `FrameworkNotFound` | Copy Syphon.framework to syphon-lib/ |
+| `FrameworkNotFound` | Run `git submodule update --init --recursive` |
 | `ServerNotFound` | Wait 2s for server to announce |
 | `segmentation fault` | Wrap thread in `autoreleasepool` |
 

@@ -127,61 +127,84 @@ impl SyphonServerDirectory {
         use std::thread;
         use std::time::Duration;
         
-        unsafe {
-            autoreleasepool(|| {
-                // Get the shared directory
-                let dir = Self::shared_directory();
-                
-                // Request servers to announce themselves
-                let _: () = msg_send![dir, requestServerAnnounce];
-                
-                // Wait for announcements with run loop processing
-                let mut count = 0;
-                for attempt in 0..30 {
-                    // Process run loop to receive distributed notifications
-                    let run_loop: *mut Object = msg_send![Class::get("NSRunLoop").unwrap(), currentRunLoop];
-                    let date: *mut Object = msg_send![Class::get("NSDate").unwrap(), dateWithTimeIntervalSinceNow:0.05];
-                    let _: () = msg_send![run_loop, runUntilDate:date];
-                    
-                    thread::sleep(Duration::from_millis(50));
-                    
-                    let servers: *mut Object = msg_send![dir, servers];
-                    count = msg_send![servers, count];
-                    
-                    println!("Attempt {}: {} servers", attempt, count);
-                    
-                    if count > 0 {
-                        break;
-                    }
+        // Run on a thread with larger stack to avoid stack overflow
+        // The Objective-C runtime and Syphon framework need more stack space
+        std::thread::scope(|s| {
+            let handle = s.spawn(|| {
+                unsafe {
+                    autoreleasepool(|| {
+                        // Inner autoreleasepool for the loop iterations
+                        Self::servers_macos_inner()
+                    })
                 }
-                
-                // Get the final servers array
+            });
+            handle.join().unwrap_or_default()
+        })
+    }
+    
+    #[cfg(target_os = "macos")]
+    unsafe fn servers_macos_inner() -> Vec<ServerInfo> {
+        use crate::utils::from_nsstring;
+        use objc::rc::autoreleasepool;
+        use std::thread;
+        use std::time::Duration;
+        
+        // Get the shared directory
+        let dir = Self::shared_directory();
+        
+        // Request servers to announce themselves
+        let _: () = msg_send![dir, requestServerAnnounce];
+        
+        // Wait for announcements with run loop processing
+        let mut count = 0;
+        for attempt in 0..30 {
+            // Process run loop to receive distributed notifications
+            // Use a fresh autoreleasepool for each iteration to prevent memory buildup
+            autoreleasepool(|| {
+                let run_loop: *mut Object = msg_send![Class::get("NSRunLoop").unwrap(), currentRunLoop];
+                let date: *mut Object = msg_send![Class::get("NSDate").unwrap(), dateWithTimeIntervalSinceNow:0.05];
+                let _: () = msg_send![run_loop, runUntilDate:date];
+            });
+            
+            thread::sleep(Duration::from_millis(50));
+            
+            autoreleasepool(|| {
                 let servers: *mut Object = msg_send![dir, servers];
                 count = msg_send![servers, count];
-                
-                let mut result = Vec::with_capacity(count);
-                
-                for i in 0..count {
-                    let server_desc: *mut Object = msg_send![servers, objectAtIndex:i];
-                    
-                    // Extract values using objectForKey: with full Syphon constant names
-                    // Note: KVC (valueForKey:) doesn't work with these keys
-                    let name = Self::string_for_key(server_desc, "SyphonServerDescriptionNameKey");
-                    let uuid = Self::string_for_key(server_desc, "SyphonServerDescriptionUUIDKey");
-                    let app = Self::string_for_key(server_desc, "SyphonServerDescriptionAppNameKey");
-                    let bundle = Self::string_for_key(server_desc, "SyphonServerDescriptionAppBundleIdentifierKey");
-                    
-                    result.push(ServerInfo {
-                        name,
-                        uuid,
-                        app_name: app,
-                        bundle_id: bundle,
-                    });
-                }
-                
-                result
-            })
+            });
+            
+            if count > 0 {
+                break;
+            }
         }
+        
+        // Get the final servers array
+        let servers: *mut Object = msg_send![dir, servers];
+        count = msg_send![servers, count];
+        
+        let mut result = Vec::with_capacity(count);
+        
+        for i in 0..count {
+            autoreleasepool(|| {
+                let server_desc: *mut Object = msg_send![servers, objectAtIndex:i];
+                
+                // Extract values using objectForKey: with full Syphon constant names
+                // Note: KVC (valueForKey:) doesn't work with these keys
+                let name = Self::string_for_key(server_desc, "SyphonServerDescriptionNameKey");
+                let uuid = Self::string_for_key(server_desc, "SyphonServerDescriptionUUIDKey");
+                let app = Self::string_for_key(server_desc, "SyphonServerDescriptionAppNameKey");
+                let bundle = Self::string_for_key(server_desc, "SyphonServerDescriptionAppBundleIdentifierKey");
+                
+                result.push(ServerInfo {
+                    name,
+                    uuid,
+                    app_name: app,
+                    bundle_id: bundle,
+                });
+            });
+        }
+        
+        result
     }
     
     /// Get a string value using objectForKey: with the full key name

@@ -1,5 +1,70 @@
 # Syphon Crate Changelog
 
+## Version 0.3.0 (2024-03-13)
+
+### API Cleanup and Simplification
+
+This release streamlines the API by removing redundant components and focusing on the native macOS BGRA format for maximum performance.
+
+#### Removed
+
+- **Y-flip compute shader** - Removed the Metal compute shader for Y-flip. Users should now render directly to BGRA8Unorm textures in the correct orientation.
+- **Input format variants** - Removed `input_fast.rs` and `input_optimized.rs`. Now only `input.rs` with native BGRA support.
+- **BGRA to RGBA conversion** - Removed GPU conversion. The API now uses native BGRA8Unorm throughout.
+- **Redundant examples** - Removed 11 example files, keeping only the essential 3:
+  - `wgpu_sender.rs` - wgpu output example
+  - `metal_client.rs` - Zero-copy Metal client
+  - `simple_client.rs` - Basic client example
+
+#### Simplified API
+
+```rust
+// Before: Multiple input types with format conversion
+use syphon_wgpu::{SyphonWgpuInput, InputFormat};
+let mut input = SyphonWgpuInput::new(&device, &queue);
+input.set_format(InputFormat::Bgra);  // No longer needed
+
+// After: Single input type, always BGRA
+use syphon_wgpu::SyphonWgpuInput;
+let mut input = SyphonWgpuInput::new(&device, &queue);
+// Textures are always Bgra8Unorm
+```
+
+#### Migration
+
+1. **Update input usage:**
+   ```rust
+   // Remove format configuration
+   // input.set_format(...);  // No longer exists
+   
+   // Textures are always Bgra8Unorm
+   let texture = input.receive_texture(&device, &queue);
+   ```
+
+2. **Update rendering:**
+   ```rust
+   // Ensure your render target uses Bgra8Unorm
+   let texture = device.create_texture(&wgpu::TextureDescriptor {
+       format: wgpu::TextureFormat::Bgra8Unorm,
+       // ...
+   });
+   ```
+
+3. **Check examples:**
+   Many example files were removed. Update your references:
+   - `wgpu_sender.rs` (still available)
+   - `metal_client.rs` (still available)
+   - `simple_client.rs` (still available)
+
+### Documentation Updates
+
+- Updated README with simplified API
+- Updated ZERO_COPY_IMPLEMENTATION.md
+- Removed MIGRATION_GUIDE.md (no longer needed for new API)
+- Simplified DOCUMENTATION_INDEX.md
+
+---
+
 ## Version 0.2.0 (2024-03-07)
 
 ### Bug Fixes

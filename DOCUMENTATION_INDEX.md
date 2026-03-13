@@ -7,7 +7,8 @@ Welcome! Here's how to navigate the documentation.
 | Document | Purpose | Read If... |
 |----------|---------|------------|
 | [QUICKSTART.md](QUICKSTART.md) | Get running in 5 minutes | You want to try it now |
-| [README.md](README.md) | Complete overview | You want full documentation |
+| [README.md](README.md) | Complete overview with examples | You want full documentation |
+| [ZERO_COPY_IMPLEMENTATION.md](ZERO_COPY_IMPLEMENTATION.md) | Technical implementation details | You're integrating zero-copy |
 
 ## 📚 Core Documentation
 
@@ -16,7 +17,7 @@ Welcome! Here's how to navigate the documentation.
 | Document | Purpose | Read If... |
 |----------|---------|------------|
 | [README.md](README.md) | API reference, examples, patterns | You're using this crate |
-| [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md) | Upgrading from 0.1.0 | You used the old version |
+| [ZERO_COPY_IMPLEMENTATION.md](ZERO_COPY_IMPLEMENTATION.md) | Deep dive on zero-copy architecture | You need to understand the internals |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Fix common issues | Something isn't working |
 
 ### Project Information
@@ -32,7 +33,7 @@ Welcome! Here's how to navigate the documentation.
 crates/syphon/
 ├── README.md                  # Main documentation
 ├── QUICKSTART.md              # 5-minute quick start
-├── MIGRATION_GUIDE.md         # Upgrading guide
+├── ZERO_COPY_IMPLEMENTATION.md # Technical deep-dive
 ├── TROUBLESHOOTING.md         # Problem solving
 ├── CHANGES.md                 # Version history
 ├── DOCUMENTATION_INDEX.md     # This file
@@ -43,43 +44,52 @@ crates/syphon/
 │       ├── server.rs          # SyphonServer
 │       ├── client.rs          # SyphonClient
 │       ├── directory.rs       # Server discovery
-│       └── metal_device.rs    # GPU utilities
+│       ├── metal_device.rs    # GPU utilities
+│       └── iosurface_ext.rs   # IOSurface helpers
 │
 ├── syphon-wgpu/               # wgpu integration
 │   └── src/
-│       └── lib.rs             # SyphonWgpuOutput
+│       ├── lib.rs             # SyphonWgpuOutput
+│       └── input.rs           # SyphonWgpuInput
 │
 ├── syphon-metal/              # Metal utilities
 │   └── src/
-│       └── lib.rs             # IOSurfacePool
+│       └── lib.rs             # MetalContext, IOSurfacePool
 │
 └── syphon-examples/           # Example code
     └── examples/
-        ├── simple_server.rs   # Basic server
-        ├── simple_client.rs   # Basic client
-        ├── wgpu_sender.rs     # wgpu integration
-        └── metal_sender.rs    # Metal integration
+        ├── simple_client.rs   # Basic client (CPU readback)
+        ├── metal_client.rs    # Zero-copy Metal client ⭐
+        └── wgpu_sender.rs     # wgpu integration (server)
 ```
 
 ## 🎯 Use Cases
 
-### "I want to send video from my Rust app"
+### "I want to SEND video from my Rust app"
 
-1. Read [QUICKSTART.md](QUICKSTART.md) section 3
-2. See [examples/simple_server.rs](syphon-examples/examples/simple_server.rs)
-3. Check [README.md](README.md) "Publishing from wgpu"
+| Approach | Documentation | Example |
+|----------|--------------|---------|
+| From wgpu (zero-copy) | [README.md](README.md) "Server: Publishing from wgpu" | `examples/wgpu_sender.rs` |
+| From Metal (native) | [ZERO_COPY_IMPLEMENTATION.md](ZERO_COPY_IMPLEMENTATION.md) | Create Metal texture, publish |
 
-### "I want to receive video in my Rust app"
+### "I want to RECEIVE video in my Rust app"
 
-1. Read [QUICKSTART.md](QUICKSTART.md) section 4
-2. See [examples/simple_client.rs](syphon-examples/examples/simple_client.rs)
-3. Check [README.md](README.md) "Receiving in a Background Thread"
+| Approach | Documentation | Example | Performance |
+|----------|--------------|---------|-------------|
+| Direct Metal (zero-copy) ⭐ | [ZERO_COPY_IMPLEMENTATION.md](ZERO_COPY_IMPLEMENTATION.md) "Client: Receiving" | `examples/metal_client.rs` | **~0% CPU, ~1ms latency** |
+| Via wgpu | [README.md](README.md) "Client: Receiving to wgpu" | `examples/wgpu_sender.rs` (client section) | ~5-10% CPU, ~5ms latency |
+| Simple/CPU readback | [syphon-core/src/client.rs](syphon-core/src/client.rs) | `examples/simple_client.rs` | ~5-10% CPU, ~5ms latency |
 
-### "I'm upgrading from 0.1.0"
+### "I want ZERO-COPY integration"
 
-1. Read [CHANGES.md](CHANGES.md) for summary
-2. Follow [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md)
-3. Add `autoreleasepool` to background threads
+Read these in order:
+1. [ZERO_COPY_IMPLEMENTATION.md](ZERO_COPY_IMPLEMENTATION.md) - Complete technical guide
+2. [examples/metal_client.rs](syphon-examples/examples/metal_client.rs) - Working zero-copy client
+3. [syphon-metal/src/lib.rs](syphon-metal/src/lib.rs) - Metal interop utilities
+
+Key APIs:
+- **Server**: `syphon_wgpu::SyphonWgpuOutput` or `syphon_metal::MetalContext`
+- **Client**: `syphon_metal::MetalContext::create_texture_from_iosurface()`
 
 ### "Something is crashing"
 
@@ -91,35 +101,38 @@ crates/syphon/
 
 ### Server (Publishing)
 
-- **Basic:** [examples/simple_server.rs](syphon-examples/examples/simple_server.rs)
-- **wgpu:** [examples/wgpu_sender.rs](syphon-examples/examples/wgpu_sender.rs)
-- **API:** [syphon-core/src/server.rs](syphon-core/src/server.rs)
+| Method | Example | API |
+|--------|---------|-----|
+| From wgpu | [examples/wgpu_sender.rs](syphon-examples/examples/wgpu_sender.rs) | `syphon_wgpu::SyphonWgpuOutput` |
+| From Metal | [ZERO_COPY_IMPLEMENTATION.md](ZERO_COPY_IMPLEMENTATION.md) | `syphon_core::SyphonServer` |
 
 ### Client (Receiving)
 
-- **Basic:** [examples/simple_client.rs](syphon-examples/examples/simple_client.rs)
-- **API:** [syphon-core/src/client.rs](syphon-core/src/client.rs)
+| Method | Example | API | Zero-Copy? |
+|--------|---------|-----|------------|
+| Direct Metal ⭐ | [examples/metal_client.rs](syphon-examples/examples/metal_client.rs) | `syphon_metal::MetalContext` | **Yes** |
+| To wgpu | [README.md](README.md) | `syphon_wgpu::SyphonWgpuInput` | No (CPU readback) |
+| Simple | [examples/simple_client.rs](syphon-examples/examples/simple_client.rs) | `syphon_core::SyphonClient` | No (CPU readback) |
 
 ### Discovery
 
-- **Basic:** [examples/simple_client.rs](syphon-examples/examples/simple_client.rs) (first part)
-- **API:** [syphon-core/src/directory.rs](syphon-core/src/directory.rs)
+- **Basic**: [examples/simple_client.rs](syphon-examples/examples/simple_client.rs) (first part)
+- **API**: [syphon-core/src/directory.rs](syphon-core/src/directory.rs)
 
 ### GPU/Device Selection
 
-- **API:** [syphon-core/src/metal_device.rs](syphon-core/src/metal_device.rs)
-- **Examples:** [README.md](README.md) "Checking GPU Compatibility"
+- **API**: [syphon-core/src/metal_device.rs](syphon-core/src/metal_device.rs)
+- **Examples**: [README.md](README.md) "Checking GPU Compatibility"
 
 ## 🔗 External Resources
 
 - [Syphon Framework](https://github.com/Syphon/Syphon-Framework) - Official framework
 - [Syphon Website](http://syphon.v002.info/) - Project website
-- [Rusty-404](../../../rusty-404) - Example application
-- [RustJay Waaaves](../../../rustjay_waaaves) - Example application
 
 ## 💡 Quick Tips
 
-**Always wrap background threads in autoreleasepool:**
+### Always wrap background threads in autoreleasepool:
+
 ```rust
 use objc::rc::autoreleasepool;
 
@@ -130,15 +143,33 @@ thread::spawn(move || {
 });
 ```
 
-**Use local framework, not /Library/Frameworks:**
+### Use local framework, not /Library/Frameworks:
+
 ```bash
 cp -R ~/Downloads/Syphon.framework ../crates/syphon/syphon-lib/
 ```
 
-**Check framework is working:**
+### Check framework is working:
+
 ```rust
 if !syphon_core::is_available() {
     panic!("Syphon not available!");
+}
+```
+
+### For zero-copy client, use MetalContext:
+
+```rust
+let metal_ctx = syphon_metal::MetalContext::system_default()?;
+let client = syphon_core::SyphonClient::connect("Server")?;
+
+if let Ok(Some(frame)) = client.try_receive() {
+    let texture = metal_ctx.create_texture_from_iosurface(
+        frame.iosurface(),
+        frame.width,
+        frame.height
+    )?;
+    // Use texture directly - NO CPU COPIES!
 }
 ```
 
@@ -147,7 +178,7 @@ if !syphon_core::is_available() {
 Before filing an issue:
 
 1. ✅ Check [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
-2. ✅ Test with `simple_server`/`simple_client` examples
+2. ✅ Test with `metal_client` example
 3. ✅ Enable debug logging: `RUST_LOG=debug cargo run`
 4. ✅ Include:
    - macOS version

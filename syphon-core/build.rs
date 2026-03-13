@@ -6,10 +6,24 @@ fn main() {
     #[cfg(target_os = "macos")]
     {
         // Check for local framework first (for development without system install)
-        let local_framework = std::path::PathBuf::from("../lib/Syphon.framework");
-        if local_framework.exists() {
-            let framework_path = local_framework.canonicalize().unwrap();
-            println!("cargo:rustc-link-search=framework={}", framework_path.parent().unwrap().display());
+        // Try multiple possible locations
+        let possible_paths = [
+            std::path::PathBuf::from("../syphon-lib"),  // Correct path from syphon-core
+            std::path::PathBuf::from("../lib"),          // Old path
+            std::path::PathBuf::from("../../syphon-lib"), // From deeper nesting
+        ];
+        
+        for path in &possible_paths {
+            let framework_path = path.join("Syphon.framework");
+            if framework_path.exists() {
+                let canonical = framework_path.canonicalize().unwrap();
+                let parent = canonical.parent().unwrap();
+                println!("cargo:rustc-link-search=framework={}", parent.display());
+                // Add rpath so the executable can find the framework at runtime
+                println!("cargo:rustc-link-arg=-Wl,-rpath,{}", parent.display());
+                println!("cargo:warning=Found Syphon framework at: {}", canonical.display());
+                break;
+            }
         }
         
         // Add standard system framework paths
