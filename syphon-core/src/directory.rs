@@ -75,20 +75,19 @@ impl SyphonServerDirectory {
         let initial_count: usize = msg_send![servers, count];
 
         if initial_count == 0 {
-            // Ask running servers to re-announce; the directory will update its
-            // `servers` array as the NSNotifications arrive on the run loop.
+            // Ask running servers to re-announce. The directory will update its
+            // `servers` array as NSNotifications arrive on the run loop.
+            //
+            // IMPORTANT: Do NOT spin the run loop here with `runUntilDate:`.
+            // This function may be called from within a winit ApplicationHandler
+            // callback (e.g. `resumed`, `about_to_wait`). Winit's macOS backend
+            // sets a re-entrancy guard around all event-handler dispatches; if the
+            // run loop delivers another AppKit/winit event while that guard is held,
+            // winit panics with "tried to handle event while another event is
+            // currently being handled". Return immediately — the server list will be
+            // populated on the next call once winit has naturally processed the
+            // incoming NSNotifications through its own event loop iteration.
             let _: () = msg_send![dir, requestServerAnnounce];
-
-            autoreleasepool(|| {
-                let run_loop: *mut Object =
-                    msg_send![Class::get("NSRunLoop").unwrap(), currentRunLoop];
-                // 200 ms is enough for local IPC notifications to arrive.
-                let deadline: *mut Object = msg_send![
-                    Class::get("NSDate").unwrap(),
-                    dateWithTimeIntervalSinceNow: 0.2f64
-                ];
-                let _: () = msg_send![run_loop, runUntilDate: deadline];
-            });
         }
 
         let servers: *mut Object = msg_send![dir, servers];

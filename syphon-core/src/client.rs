@@ -242,23 +242,16 @@ impl SyphonClient {
     /// run loop for 200 ms so incoming NSNotifications can be delivered.
     #[cfg(target_os = "macos")]
     unsafe fn ensure_servers_populated(dir: *mut Object) {
-        use objc::rc::autoreleasepool;
-
         let servers: *mut Object = msg_send![dir, servers];
         let count: usize = msg_send![servers, count];
         if count > 0 { return; }
 
+        // Ask servers to re-announce, but do NOT spin the run loop.
+        // See the matching comment in `directory.rs::servers_inner` —
+        // spinning `[NSRunLoop runUntilDate:]` from inside a winit
+        // ApplicationHandler callback causes winit's re-entrancy guard to panic.
+        // The caller should retry if `ServerNotFound` is returned on first use.
         let _: () = msg_send![dir, requestServerAnnounce];
-
-        autoreleasepool(|| {
-            let run_loop: *mut Object =
-                msg_send![Class::get("NSRunLoop").unwrap(), currentRunLoop];
-            let deadline: *mut Object = msg_send![
-                Class::get("NSDate").unwrap(),
-                dateWithTimeIntervalSinceNow: 0.2f64
-            ];
-            let _: () = msg_send![run_loop, runUntilDate: deadline];
-        });
     }
 
     #[cfg(target_os = "macos")]
