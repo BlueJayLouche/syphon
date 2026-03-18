@@ -83,9 +83,9 @@ Zero-Copy (GPU only):
 - `wgpu_interop` - Extract raw Metal handles from wgpu objects
 
 #### syphon-wgpu
-- `SyphonWgpuOutput` - Publish wgpu textures to Syphon (server)
-- `SyphonWgpuInput` - Receive frames as wgpu textures (client)
-- Zero-copy path via wgpu-hal Metal interop
+- `SyphonWgpuOutput` - Publish wgpu textures to Syphon (server); returns `PublishStatus`
+- `SyphonWgpuInput` - Receive frames as wgpu textures (client); GPU blit on Metal
+- `metal_interop` - All `wgpu-hal` version-specific code isolated here (wgpu 25.0)
 
 ---
 
@@ -93,39 +93,36 @@ Zero-Copy (GPU only):
 
 ### The Zero-Copy Flow (Server)
 
+All `wgpu-hal` calls are isolated in `metal_interop.rs` — upgrading wgpu only requires
+editing that file.
+
 ```rust
 // 1. Acquire IOSurface from pool
 let surface = surface_pool.acquire();
 
-// 2. Create destination texture from IOSurface (raw MTLTexture)
+// 2. Create IOSurface-backed destination texture (shares GPU memory)
 let dest_texture = create_iosurface_texture(&surface, width, height);
 
-// 3. Get wgpu's raw Metal texture and queue via wgpu-hal
-queue.as_hal::<wgpu_hal::api::Metal, _, _>(|hal_queue| {
-    texture.as_hal::<wgpu_hal::api::Metal, _, _>(|hal_tex| {
-        let src_texture = hal_tex.raw_handle();
-        let raw_queue = hal_queue.as_raw().lock();
-        
-        // 4. Create command buffer on wgpu's queue
-        let cmd_buf = raw_queue.new_command_buffer();
-        
-        // 5. Simple blit copy (native BGRA, no conversion)
-        let blit = cmd_buf.new_blit_command_encoder();
-        blit.copy_from_texture(
-            src_texture,
-            0, 0, MTLOrigin { x: 0, y: 0, z: 0 },
-            MTLSize { width, height, depth: 1 },
-            &dest_texture,
-            0, 0, MTLOrigin { x: 0, y: 0, z: 0 },
-        );
-        blit.end_encoding();
-        
-        // 6. Publish to Syphon before committing
-        server.publish_metal_texture(dest_texture, cmd_buf);
-        
-        // 7. Commit through wgpu's queue (critical for synchronization)
-        cmd_buf.commit();
-    });
+// 3. Blit from wgpu source → IOSurface-backed destination on wgpu's own queue
+//    (metal_interop abstracts the wgpu-hal version-specific calls)
+metal_interop::with_metal_queue_and_texture(&queue, &texture, |raw_queue, src| {
+    let cmd_buf = raw_queue.new_command_buffer();
+    let blit = cmd_buf.new_blit_command_encoder();
+    blit.copy_from_texture(
+        src,
+        0, 0, MTLOrigin { x: 0, y: 0, z: 0 },
+        MTLSize { width, height, depth: 1 },
+        &dest_texture,
+        0, 0, MTLOrigin { x: 0, y: 0, z: 0 },
+    );
+    blit.end_encoding();
+
+    // 4. Publish to Syphon before committing
+    server.publish_metal_texture(dest_texture, cmd_buf);
+
+    // 5. Commit on wgpu's queue — Metal ordering guarantees blit precedes
+    //    any subsequent wgpu render commands
+    cmd_buf.commit();
 });
 ```
 
@@ -384,25 +381,30 @@ if output.is_zero_copy() {
 output.publish(&render_texture, &device, &queue);
 ```
 
-### Client: Receiving to wgpu
+### Client: Receiving to wgpu (Zero-Copy on Metal)
+
+`SyphonWgpuInput` performs a GPU-to-GPU Metal blit when the wgpu device is Metal-backed:
+
+```
+IOSurface ← zero-copy Metal texture alias ──blit──► wgpu output texture
+                                          (no CPU involvement)
+```
 
 ```rust
 use syphon_wgpu::SyphonWgpuInput;
 
-// Create input handler
 let mut input = SyphonWgpuInput::new(&device, &queue);
 
-// Connect to a server
-input.connect("Simple Server").unwrap();
-
-// Receive frames as wgpu textures (BGRA8Unorm format)
-if let Some(texture) = input.receive_texture(&device, &queue) {
-    // Use texture in your render pipeline
-    // Format is Bgra8Unorm (native Syphon format)
+// Push-based: woken exactly when a new frame is published
+let rx = input.connect_with_channel("My Server")?;
+while rx.recv().is_ok() {
+    if let Some(texture) = input.receive_texture(&device, &queue) {
+        // Bgra8Unorm, blitted GPU-to-GPU with zero CPU copies
+    }
 }
 ```
 
-**Note**: The wgpu input implementation uses CPU readback. True zero-copy wgpu→IOSurface→wgpu requires `wgpu-hal` support for creating textures from external Metal handles.
+CPU fallback is retained for non-Metal backends and logged as a warning.
 
 ---
 
@@ -419,7 +421,8 @@ if let Some(texture) = input.receive_texture(&device, &queue) {
 
 | Method | CPU Overhead | Latency | Throughput |
 |--------|-------------|---------|------------|
-| Direct Metal (IOSurface) | ~0% | ~1ms | 60-240 FPS @ 4K |
+| Direct Metal (IOSurface alias) | ~0% | ~1ms | 60-240 FPS @ 4K |
+| wgpu Input (Metal blit) | ~0% | ~1ms | 60-240 FPS @ 4K |
 | CPU Readback (to_vec) | ~5-10% | ~5ms | 30-60 FPS @ 4K |
 
 ---
@@ -453,9 +456,8 @@ cargo run --example simple_client --release
 ## Known Limitations
 
 1. **Syphon Framework**: Must be installed or bundled for linking
-2. **Metal-only**: Zero-copy requires Metal backend
+2. **Metal-only**: Zero-copy requires Metal backend (CPU fallback available for other backends)
 3. **Format**: BGRA8Unorm only (native macOS format)
-4. **wgpu input**: Currently uses CPU readback; true zero-copy requires wgpu-hal texture-from-handle support
 
 ---
 
@@ -481,17 +483,15 @@ cargo run --example simple_client --release
 
 ### Memory leaks
 
-- Ensure `autoreleasepool` is used around Objective-C calls in loops
-- Drop `Frame` objects promptly to release IOSurface references
-- Use `IOSurfacePool` for managing surface lifecycles
+- Drop `Frame` objects promptly to release IOSurface references back to the pool
+- Autorelease pools are managed internally — no user-level wrappers needed
 
 ---
 
 ## Future Improvements
 
 1. **Async publish**: Non-blocking publish with fence synchronization
-2. **Direct render-to-IOSurface**: Create wgpu texture directly from IOSurface
-3. **True zero-copy wgpu input**: Create wgpu textures from IOSurface Metal handles
+2. **Direct render-to-IOSurface**: Create wgpu texture directly from IOSurface to skip the blit entirely
 
 ---
 
@@ -515,9 +515,9 @@ cargo run --example simple_client --release
 - ✅ CPU fallback for compatibility
 
 **Client (Receiving):**
-- ✅ Direct Metal texture from IOSurface
-- ✅ Zero-copy GPU access
-- ⚠️  wgpu input uses CPU readback (waiting on wgpu-hal support)
+- ✅ Direct Metal texture from IOSurface (zero-copy alias)
+- ✅ wgpu input via GPU blit — zero CPU copies on Metal backend
+- ✅ Push-based delivery via `connect_with_channel()` — no polling
 
 ---
 

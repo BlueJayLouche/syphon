@@ -64,23 +64,20 @@ objc[PID]: Attempt to use unknown class 0x...
 zsh: segmentation fault
 ```
 
-**Cause:** Missing `autoreleasepool` around Objective-C code.
+**Cause:** Missing `autoreleasepool` in user code that calls ObjC APIs directly.
 
-**Solution:**
+Syphon crate methods manage their own autorelease pools internally — you do **not** need
+to wrap calls like `SyphonClient::connect()` or `receive_texture()`.
 
-Wrap all Syphon usage in autoreleasepool, especially in background threads:
+If you are writing your own ObjC interop in the same thread (e.g. calling `msg_send!`
+directly), wrap those calls:
 
 ```rust
 use objc::rc::autoreleasepool;
 
-// Main thread - usually OK
-let client = SyphonClient::connect("Server")?;
-
-// Background thread - REQUIRED!
 thread::spawn(move || {
     autoreleasepool(|| {
-        let client = SyphonClient::connect("Server").unwrap();
-        // ... use client
+        // your own ObjC calls here
     });
 });
 ```
@@ -96,20 +93,14 @@ No Syphon servers found. Make sure you have a server running.
 
 **Causes & Solutions:**
 
-#### A. Timing issue
+#### A. Server not started yet
 
-The client checks before server announces:
+`SyphonServerDirectory::servers()` already handles timing internally:
+- Returns immediately if any servers are already registered
+- Otherwise sends `requestServerAnnounce` and waits up to 200ms for responses
 
-```rust
-// Retry with delay
-for attempt in 0..10 {
-    let servers = SyphonServerDirectory::servers();
-    if !servers.is_empty() {
-        break;
-    }
-    thread::sleep(Duration::from_millis(200));
-}
-```
+If `servers()` returns empty, the server process is simply not running yet. Start the
+server and call `servers()` again — no manual retry loop needed.
 
 #### B. Different framework instances
 
@@ -135,16 +126,23 @@ Check System Preferences > Security & Privacy:
 
 **Problem:** Receive loop consuming 100% CPU.
 
-**Solution:** Add sleep to the loop:
+**Best solution:** Switch to push-based delivery — zero CPU when idle:
+
+```rust
+let rx = input.connect_with_channel("Server")?;
+while rx.recv().is_ok() {
+    // woken exactly when a new frame arrives
+    if let Some(texture) = input.receive_texture(&device, &queue) { ... }
+}
+```
+
+**Alternative (polling):** Add a sleep to avoid busy-waiting:
 
 ```rust
 while running.load(Ordering::SeqCst) {
     match client.try_receive() {
         Ok(Some(frame)) => { /* process */ }
-        Ok(None) => {
-            // ESSENTIAL: Prevent busy-waiting
-            thread::sleep(Duration::from_millis(1));
-        }
+        Ok(None) => thread::sleep(Duration::from_millis(1)),
         Err(e) => log::warn!("Error: {}", e),
     }
 }
@@ -399,25 +397,14 @@ loop {
 
 ### 12. Memory leaks in long-running clients
 
-**Cause:** Not releasing frames or autoreleasepool accumulation
+**Cause:** Not releasing frames promptly.
 
-**Solution:**
+The Syphon crate internalises autorelease pool management. The main thing to watch:
+drop `Frame` objects as soon as you are done with them so the IOSurface goes back to
+the server's pool. Holding frames across multiple loop iterations can exhaust the pool.
 
-```rust
-thread::spawn(move || {
-    autoreleasepool(|| {  // Outer pool for thread
-        loop {
-            autoreleasepool(|| {  // Inner pool for each iteration
-                if let Ok(Some(frame)) = client.try_receive() {
-                    process_frame(frame);
-                }
-                // Frame dropped here, pool drained
-            });
-            thread::sleep(Duration::from_millis(1));
-        }
-    });
-});
-```
+Using push-based delivery (`connect_with_channel`) means your code wakes only when a
+frame is available, which naturally keeps one frame in flight at a time.
 
 ---
 
@@ -442,12 +429,16 @@ objc = "0.2"
 
 ### "wgpu_hal not found"
 
-For zero-copy wgpu, you need wgpu with metal feature:
+For zero-copy wgpu, you need wgpu with the Metal feature enabled. The crate currently
+targets wgpu 25.x:
 
 ```toml
 [dependencies]
-wgpu = { version = "22", features = ["metal"] }
+wgpu = { version = "25", features = ["metal"] }
 ```
+
+All `wgpu-hal` interop is isolated in `syphon-wgpu/src/metal_interop.rs` — when
+upgrading wgpu, that is the only file that needs updating.
 
 ---
 
@@ -567,7 +558,7 @@ Before filing an issue:
 2. ✅ For zero-copy issues, test with `metal_client` example
 3. ✅ Enable debug logging
 4. ✅ Check framework installation
-5. ✅ Verify autoreleasepool usage
+5. ✅ If using direct ObjC calls, verify autoreleasepool usage in those paths
 
 Include in bug report:
 - macOS version (`sw_vers`)
@@ -611,10 +602,11 @@ cargo run --example metal_client -- "Server Name"
 | Error | Likely Cause | Solution |
 |-------|--------------|----------|
 | `Library not loaded` | Framework path issue | Check DYLD_FRAMEWORK_PATH or rpath |
-| `Attempt to use unknown class` | Missing autoreleasepool | Wrap code in `autoreleasepool` |
-| `Server not found` | Timing or framework mismatch | Add retry delay, check framework paths |
+| `Attempt to use unknown class` | Missing autoreleasepool in your own ObjC code | Wrap direct ObjC calls in `autoreleasepool` |
+| `AmbiguousServerName` | Multiple servers share the same name | Use `connect_by_info()` with a UUID |
+| `Server not found` | Server not running or framework mismatch | Start the server, check framework paths |
 | `Failed to lock IOSurface` | Frame in use or dropped | Retry, ensure frame not dropped early |
 | `Failed to create Metal texture` | Format/dimension mismatch | Check BGRA8Unorm format, use frame dimensions |
 | `Image upside-down` | Missing Y-flip | Server: use compute shader; Client: flip in shader |
 | `Black frames` | Server not sending or wrong format | Test with Simple Client app |
-| `High CPU usage` | Busy-waiting in receive loop | Add `thread::sleep(Duration::from_millis(1))` |
+| `High CPU usage` | Busy-waiting in receive loop | Use `connect_with_channel()` for push delivery, or add `thread::sleep` |

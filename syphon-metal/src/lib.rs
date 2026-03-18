@@ -137,6 +137,10 @@ pub struct MetalContext {
     queue: metal::CommandQueue,
 }
 
+// SAFETY: `metal::Device` and `metal::CommandQueue` are both thread-safe per
+// Apple's Metal documentation — they are reference-counted ObjC objects that
+// can be used concurrently from multiple threads. Creating command buffers and
+// textures from them is explicitly documented as thread-safe.
 #[cfg(target_os = "macos")]
 unsafe impl Send for MetalContext {}
 #[cfg(target_os = "macos")]

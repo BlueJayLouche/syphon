@@ -40,6 +40,10 @@ pub struct MetalDeviceInfo {
     pub gpu_family: Option<String>,
 }
 
+// SAFETY: `raw_device` is a pointer to `id<MTLDevice>`. Metal device objects
+// are explicitly documented by Apple as thread-safe singletons — they are
+// reference-counted and safe to use concurrently from multiple threads.
+// The remaining fields are plain Rust types that are trivially Send + Sync.
 #[cfg(target_os = "macos")]
 unsafe impl Send for MetalDeviceInfo {}
 #[cfg(target_os = "macos")]

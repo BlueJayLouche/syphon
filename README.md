@@ -1,32 +1,37 @@
 # Syphon
 
-Rust bindings and utilities for [Syphon](https://syphon.v002.info/) - an open source macOS framework for sharing video between applications in real-time, with **zero-copy GPU-to-GPU support** for both sending and receiving.
+Rust bindings and utilities for [Syphon](https://syphon.v002.info/) — an open source macOS framework for sharing video between applications in real-time, with **zero-copy GPU-to-GPU support** for both sending and receiving.
 
 ## Overview
 
 This workspace provides Rust crates for integrating Syphon frame sharing into your applications with maximum performance:
 
 - **Zero-copy publishing** from wgpu/Metal textures to Syphon
-- **Zero-copy receiving** as Metal textures
-- **Native BGRA format** - no format conversion overhead
-- **IOSurface-backed** shared GPU memory
+- **Zero-copy receiving** as wgpu or Metal textures (IOSurface GPU blit, no CPU copies)
+- **Push-based delivery** via `newFrameHandler` — no polling
+- **Native BGRA format** — no format conversion overhead
+- **UUID-based server discovery** — unambiguous even when names collide
 
 ## Features
 
 - ✅ **Zero-Copy GPU Transfer**: Both send and receive without CPU readback
+- ✅ **Push-Based Frame Delivery**: `connect_with_channel()` wakes your thread on every new frame
+- ✅ **UUID Server Lookup**: `connect_by_info()` is unambiguous — no more name collisions
+- ✅ **Explicit Transfer Status**: `publish()` returns `PublishStatus` — no silent CPU fallbacks
 - ✅ **Direct Metal Interop**: Access frames as `MTLTexture` for custom rendering
 - ✅ **IOSurface Backing**: Shared GPU memory for efficient texture sharing
 - ✅ **Triple-Buffering**: Prevents GPU stalls with automatic surface pooling
 - ✅ **wgpu Integration**: High-level API for wgpu applications
-- ✅ **Production Ready**: Stable API with proper error handling
+- ✅ **Private Server Support**: `ServerOptions { is_private: true }` hides from directory
+- ✅ **wgpu-hal Isolation**: All version-specific interop in one file (`metal_interop.rs`)
 
 ## Crates
 
 | Crate | Description |
 |-------|-------------|
-| [`syphon-core`](./syphon-core/) | Core Objective-C bindings - `SyphonServer`, `SyphonClient`, `Frame` |
-| [`syphon-metal`](./syphon-metal/) | Metal/IOSurface utilities - `MetalContext`, `IOSurfacePool` |
-| [`syphon-wgpu`](./syphon-wgpu/) | High-level wgpu integration - `SyphonWgpuOutput`, `SyphonWgpuInput` |
+| [`syphon-core`](./syphon-core/) | Core Objective-C bindings — `SyphonServer`, `SyphonClient`, `Frame` |
+| [`syphon-metal`](./syphon-metal/) | Metal/IOSurface utilities — `MetalContext`, `IOSurfacePool` |
+| [`syphon-wgpu`](./syphon-wgpu/) | High-level wgpu integration — `SyphonWgpuOutput`, `SyphonWgpuInput` |
 | [`syphon-examples`](./syphon-examples/) | Minimal example applications |
 
 ## Requirements
@@ -58,7 +63,7 @@ cargo run --example metal_client --release     # Receive with Metal (zero-copy)
 ### Server: Publishing from wgpu
 
 ```rust
-use syphon_wgpu::SyphonWgpuOutput;
+use syphon_wgpu::{SyphonWgpuOutput, PublishStatus};
 
 // Create the Syphon output
 let mut output = SyphonWgpuOutput::new(
@@ -69,14 +74,65 @@ let mut output = SyphonWgpuOutput::new(
     1080           // Height
 ).expect("Failed to create Syphon output");
 
-// Check if zero-copy is active
-if output.is_zero_copy() {
-    println!("Using zero-copy GPU path!");
+// Each frame, publish your rendered Bgra8Unorm texture.
+// publish() returns a status so silent CPU fallbacks are impossible.
+match output.publish(&render_texture, &wgpu_device, &wgpu_queue) {
+    PublishStatus::ZeroCopy   => { /* GPU-to-GPU blit, ~0% CPU */ }
+    PublishStatus::CpuFallback => log::warn!("CPU fallback — check Metal setup"),
+    PublishStatus::NoClients  => { /* No receivers connected */ }
+    PublishStatus::PoolExhausted => log::warn!("Increase pool_size in SyphonOutputConfig"),
 }
+```
 
-// Each frame, publish your rendered texture
-// Use Bgra8Unorm format for native performance
-output.publish(&render_texture, &wgpu_device, &wgpu_queue);
+#### Advanced: private servers and custom pool size
+
+```rust
+use syphon_wgpu::{SyphonWgpuOutput, SyphonOutputConfig, ServerOptions};
+
+let config = SyphonOutputConfig {
+    pool_size: 4,                             // default: 3
+    server_options: ServerOptions { is_private: true }, // hidden from directory
+};
+let mut output = SyphonWgpuOutput::new_with_config(
+    "Hidden App", &device, &queue, 1920, 1080, config
+)?;
+```
+
+### Client: Push-Based Delivery (Recommended)
+
+No polling — the receiver channel wakes your thread exactly when a new frame is available:
+
+```rust
+use syphon_wgpu::SyphonWgpuInput;
+
+let mut input = SyphonWgpuInput::new(&device, &queue);
+let rx = input.connect_with_channel("My App")?;
+
+thread::spawn(move || {
+    while rx.recv().is_ok() {
+        if let Some(texture) = input.receive_texture(&device, &queue) {
+            // texture is Bgra8Unorm, GPU-blitted zero-copy on Metal
+        }
+    }
+});
+```
+
+### Client: UUID-Based Connection (Unambiguous)
+
+When multiple servers might share a name, list them and connect by `ServerInfo`:
+
+```rust
+use syphon_core::SyphonServerDirectory;
+use syphon_wgpu::SyphonWgpuInput;
+
+let servers = SyphonServerDirectory::servers();
+// servers() returns immediately if any are already announced;
+// otherwise it triggers requestServerAnnounce and waits up to 200ms.
+
+if let Some(info) = servers.iter().find(|s| s.app_name == "Resolume") {
+    let mut input = SyphonWgpuInput::new(&device, &queue);
+    input.connect_by_info(info)?;   // matched by UUID — never ambiguous
+}
 ```
 
 ### Client: Receiving with Direct Metal (Zero-Copy)
@@ -87,49 +143,18 @@ For maximum performance when integrating into Metal-based applications:
 use syphon_core::SyphonClient;
 use syphon_metal::MetalContext;
 
-// Create a Metal context
-let metal_ctx = MetalContext::system_default()
-    .expect("Metal not available");
+let metal_ctx = MetalContext::system_default().expect("Metal not available");
+let client = SyphonClient::connect("My App").expect("Failed to connect");
 
-// Connect to a Syphon server
-let client = SyphonClient::connect("Simple Server")
-    .expect("Failed to connect");
-
-// Receive frames
 loop {
-    if let Ok(Some(mut frame)) = client.try_receive() {
-        // ZERO-COPY: Create Metal texture directly from IOSurface
-        let surface = frame.iosurface();
+    if let Ok(Some(frame)) = client.try_receive() {
+        // ZERO-COPY: Metal texture aliasing the IOSurface GPU memory
         let texture = metal_ctx.create_texture_from_iosurface(
-            surface,
-            frame.width,
-            frame.height
+            frame.iosurface(), frame.width, frame.height
         ).expect("Failed to create texture");
-        
-        // Use texture in your Metal render pipeline
-        // Format is native BGRA8Unorm
+        // Format is BGRA8Unorm — no conversion needed
         render_with_metal_texture(&texture);
-        
-        // Texture and IOSurface are released when dropped
     }
-}
-```
-
-### Client: Receiving to wgpu
-
-```rust
-use syphon_wgpu::SyphonWgpuInput;
-
-// Create input handler
-let mut input = SyphonWgpuInput::new(&device, &queue);
-
-// Connect to a server
-input.connect("Simple Server").unwrap();
-
-// Receive frames as wgpu textures (BGRA8Unorm format)
-if let Some(texture) = input.receive_texture(&device, &queue) {
-    // Use texture in your wgpu render pipeline
-    // Format is Bgra8Unorm (native Syphon format)
 }
 ```
 
@@ -140,17 +165,10 @@ For simple use cases where you need raw pixel data:
 ```rust
 use syphon_core::SyphonClient;
 
-let client = SyphonClient::connect("Simple Server")?;
-
+let client = SyphonClient::connect("My App")?;
 if let Ok(Some(mut frame)) = client.try_receive() {
-    // Access frame dimensions
     println!("Frame: {}x{}", frame.width, frame.height);
-    
-    // Get raw IOSurface reference (for zero-copy interop)
-    let surface = frame.iosurface();
-    
-    // Or copy to CPU memory (not zero-copy)
-    let pixel_data: Vec<u8> = frame.to_vec()?;
+    let pixel_data: Vec<u8> = frame.to_vec()?; // CPU copy — use sparingly
 }
 ```
 
@@ -167,31 +185,33 @@ SENDER                                  RECEIVER
 │  │ wgpu Texture  │  │                │  │ wgpu/Metal    │  │
 │  │ (Bgra8Unorm)  │  │                │  │ Texture       │  │
 │  └───────┬───────┘  │                │  └───────┬───────┘  │
-│          │          │                │          ▲          │
+│          │ GPU blit │                │          ▲ GPU blit │
 │          ▼          │                │          │          │
 │  ┌───────────────┐  │                │  ┌───────────────┐  │
 │  │  IOSurface    │◄─┼────────────────┼──┤  IOSurface    │  │
-│  │  (shared mem) │  │   Syphon.framework   │  (shared mem) │  │
+│  │  (shared mem) │  │  Syphon.framework  │  (shared mem) │  │
 │  └───────────────┘  │                │  └───────────────┘  │
-│                     │                │                     │
 └─────────────────────┘                └─────────────────────┘
+        No CPU copies end-to-end (Metal backend)
 ```
 
 ### Key Components
 
 1. **syphon-core**: Core FFI bindings to Syphon.framework
-   - `SyphonServer` - Publishes frames
-   - `SyphonClient` - Receives frames
-   - `Frame` - Contains IOSurface reference
+   - `SyphonServer` — Publishes frames; supports `ServerOptions`
+   - `SyphonClient` — Receives frames; push (`connect_with_channel`) or poll (`try_receive`)
+   - `SyphonServerDirectory` — Fast server discovery via `requestServerAnnounce`
+   - `Frame` — Contains IOSurface reference
 
 2. **syphon-metal**: Metal interop utilities
-   - `MetalContext` - Metal device/queue management
-   - `IOSurfacePool` - Efficient surface reuse
-   - `create_texture_from_iosurface()` - Zero-copy texture creation
+   - `MetalContext` — Metal device/queue management
+   - `IOSurfacePool` — Efficient triple-buffered surface reuse
+   - `create_texture_from_iosurface()` — Zero-copy texture aliasing
 
 3. **syphon-wgpu**: High-level wgpu integration
-   - `SyphonWgpuOutput` - Publish wgpu textures
-   - `SyphonWgpuInput` - Receive to wgpu textures
+   - `SyphonWgpuOutput` — Publish wgpu textures; returns `PublishStatus`
+   - `SyphonWgpuInput` — Receive to wgpu textures; GPU blit on Metal
+   - `metal_interop` — All `wgpu-hal` version-specific code isolated here
 
 ## Format
 
@@ -204,133 +224,109 @@ This eliminates all format conversion overhead and provides maximum performance.
 
 ## Performance
 
-### Zero-Copy vs CPU Readback
-
 | Operation | CPU Overhead | Latency | Throughput |
 |-----------|-------------|---------|------------|
 | **Server Zero-Copy** (publish) | ~0% | ~1ms | 60-240 FPS @ 4K |
-| **Client Zero-Copy** (Metal) | ~0% | ~1ms | 60-240 FPS @ 4K |
-| **Client wgpu Input** | ~5-10% | ~5ms | 30-60 FPS @ 4K |
+| **Client wgpu Input** (Metal blit) | ~0% | ~1ms | 60-240 FPS @ 4K |
+| **Client Metal** (IOSurface alias) | ~0% | ~1ms | 60-240 FPS @ 4K |
+| **CPU Fallback** (any path) | ~5-10% | ~5ms | 30-60 FPS @ 4K |
 
-Zero-copy eliminates:
-- GPU→CPU memory transfers
-- CPU→GPU texture uploads
-- Frame copies and staging buffers
-- Format conversion
+Zero-copy eliminates GPU→CPU transfers, CPU→GPU uploads, staging buffers, and format conversion.
 
 ## Examples
 
 ```bash
-# Server example - wgpu zero-copy sender
+# Server example — wgpu zero-copy sender
 cargo run --example wgpu_sender --release
 
-# Client example - Direct Metal (zero-copy - FASTEST)
+# Client example — Direct Metal (zero-copy, fastest)
 cargo run --example metal_client --release -- "Server Name"
 
 # Simple client example
 cargo run --example simple_client --release
 ```
 
+## Upgrading wgpu
+
+All `wgpu-hal` Metal API calls are isolated in `syphon-wgpu/src/metal_interop.rs`.
+When upgrading wgpu, edit only that file and update the version banner at the top.
+
 ## Building for Production
-
-### Linking the Syphon Framework
-
-For distribution, you need to link against the Syphon framework:
 
 ```bash
 # Build with the bundled framework
 cargo build --release
-
-# The framework will be linked from syphon-lib/Syphon-Framework
+# The framework is linked from syphon-lib/Syphon.framework
 ```
-
-### Embedding the Framework
 
 To create a standalone app bundle:
 
 ```bash
-# Copy the framework into your app bundle
-cp -R syphon-lib/Syphon-Framework/Syphon.framework \
-   MyApp.app/Contents/Frameworks/
-
-# Update the rpath
+cp -R syphon-lib/Syphon.framework MyApp.app/Contents/Frameworks/
 codesign --force --deep --sign - MyApp.app
 ```
 
 ## Documentation
 
-- **[ZERO_COPY_IMPLEMENTATION.md](./ZERO_COPY_IMPLEMENTATION.md)** - Complete technical details
-- **[TROUBLESHOOTING.md](./TROUBLESHOOTING.md)** - Common issues and solutions
-- **[QUICKSTART.md](./QUICKSTART.md)** - Get started in 5 minutes
+- **[ZERO_COPY_IMPLEMENTATION.md](./ZERO_COPY_IMPLEMENTATION.md)** — Complete technical details
+- **[TROUBLESHOOTING.md](./TROUBLESHOOTING.md)** — Common issues and solutions
+- **[QUICKSTART.md](./QUICKSTART.md)** — Get started in 5 minutes
+- **[CHANGES.md](./CHANGES.md)** — Version history
 
 ## Syphon Framework
 
 This repository includes the Syphon framework as a Git submodule:
 
 ```bash
-# Update to latest Syphon framework
 cd syphon-lib/Syphon-Framework
 git pull origin main
 ```
-
-See [syphon-lib/Syphon-Framework](./syphon-lib/Syphon-Framework/) for the upstream source.
 
 ## Troubleshooting
 
 ### "framework 'Syphon' not found"
 
-The Syphon framework needs to be available at link time:
-
 ```bash
-# Install Syphon framework system-wide (optional)
-sudo cp -R syphon-lib/Syphon-Framework/Syphon.framework /Library/Frameworks/
+# Install system-wide (optional)
+sudo cp -R syphon-lib/Syphon.framework /Library/Frameworks/
 
-# Or set the framework search path
-export LIBRARY_PATH="$PWD/syphon-lib/Syphon-Framework:$LIBRARY_PATH"
+# Or set the search path at runtime
+export DYLD_FRAMEWORK_PATH="$PWD/syphon-lib"
 ```
 
 ### Zero-copy not working (Server)
 
-Check that:
-1. You're using the Metal backend (`wgpu::Backends::METAL`)
-2. The texture format is `Bgra8Unorm`
-3. The texture has `COPY_SRC` usage
+1. Use the Metal backend (`wgpu::Backends::METAL`)
+2. Texture format must be `Bgra8Unorm`
+3. Texture must have `COPY_SRC` usage
 
-Enable logging to see which path is being used:
 ```bash
 RUST_LOG=info cargo run --example wgpu_sender
 ```
 
-### Zero-copy not working (Client)
+`publish()` returns `PublishStatus::CpuFallback` if the zero-copy path is unavailable.
 
-For direct Metal client:
-1. Ensure `MetalContext::system_default()` succeeds
-2. Check IOSurface dimensions match expected texture size
-3. Verify texture format is `BGRA8Unorm`
+### Multiple servers with the same name
+
+`connect()` returns `SyphonError::AmbiguousServerName`. Use `connect_by_info()` instead:
+
+```rust
+let servers = SyphonServerDirectory::servers();
+let info = servers.iter().find(|s| s.uuid == "known-uuid").unwrap();
+client.connect_by_info(info)?;
+```
 
 ## License
 
-Licensed under the MIT License - see [LICENSE](./LICENSE) for details.
-
+Licensed under the MIT License — see [LICENSE](./LICENSE) for details.
 The bundled Syphon.framework is licensed under the BSD 3-Clause License.
 
 ## Links
 
 - [Syphon Official Website](https://syphon.v002.info/)
 - [Syphon Framework GitHub](https://github.com/Syphon/Syphon-Framework)
-- [vvvv.org - Syphon Documentation](https://vvvv.org/documentation/syphon)
 
 ## Note
 
-Syphon is macOS only. For cross-platform video sharing, consider:
-- [Spout](https://spout.zeal.co/) for Windows
-- [NDI](https://ndi.tv/) for cross-platform
-
-## Contributing
-
-Contributions are welcome! Areas for improvement:
-- Async publish API
-- Additional documentation
-- Performance optimizations
-
-Please read [ZERO_COPY_IMPLEMENTATION.md](./ZERO_COPY_IMPLEMENTATION.md) for technical details before contributing.
+Syphon is macOS only. For cross-platform video sharing consider
+[Spout](https://spout.zeal.co/) (Windows) or [NDI](https://ndi.tv/) (cross-platform).

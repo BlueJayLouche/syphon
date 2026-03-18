@@ -20,6 +20,7 @@ core-foundation = "0.9"
 core-graphics = "0.23"
 io-surface = "0.15"
 cocoa = "0.25"
+block = "0.1"
 libc = "0.2"
 
 [dev-dependencies]

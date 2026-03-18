@@ -41,11 +41,52 @@
 //! }
 //! ```
 
-pub use syphon_core::{SyphonServer, SyphonClient, SyphonError, Result, ServerInfo};
+pub use syphon_core::{SyphonServer, SyphonClient, SyphonError, Result, ServerInfo, ServerOptions};
+
+/// Result returned by [`SyphonWgpuOutput::publish`].
+///
+/// Check this to confirm which code path was used — never assume zero-copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishStatus {
+    /// Frame published via zero-copy GPU blit through IOSurface — no CPU involved.
+    ZeroCopy,
+    /// Frame published via CPU readback (Metal interop unavailable).
+    CpuFallback,
+    /// No clients connected; frame skipped (no work done).
+    NoClients,
+    /// All IOSurfaces in the pool were in-flight; frame dropped.
+    ///
+    /// Increase `pool_size` in [`SyphonOutputConfig`] if this occurs regularly.
+    PoolExhausted,
+}
+
+/// Configuration for [`SyphonWgpuOutput`].
+#[derive(Debug, Clone)]
+pub struct SyphonOutputConfig {
+    /// Number of IOSurfaces to pre-allocate for triple-(or more) buffering.
+    ///
+    /// Must be ≥ 1. Default: `3` (suitable for ≤ 120 Hz with typical GPU latency).
+    /// Increase to `4`–`5` at very high frame rates or if [`PublishStatus::PoolExhausted`]
+    /// appears in logs.
+    pub pool_size: usize,
+
+    /// Core Syphon server options (e.g. `is_private`).
+    pub server_options: ServerOptions,
+}
+
+impl Default for SyphonOutputConfig {
+    fn default() -> Self {
+        Self { pool_size: 3, server_options: ServerOptions::default() }
+    }
+}
 
 // Input module for receiving frames
 pub mod input;
 pub use input::SyphonWgpuInput;
+
+// All wgpu-hal Metal interop lives here — update only this when upgrading wgpu.
+#[cfg(target_os = "macos")]
+mod metal_interop;
 
 #[cfg(target_os = "macos")]
 use metal::*;
@@ -85,42 +126,54 @@ pub struct SyphonWgpuOutput {
     metal_queue: Option<CommandQueue>,
 }
 
+// SAFETY: `SyphonWgpuOutput` wraps a `SyphonServer` (Send+Sync, see its SAFETY
+// comment), a `metal::Device` and `metal::CommandQueue` (both thread-safe per
+// Apple's Metal docs), and an `IOSurfacePool` which holds `io_surface::IOSurface`
+// objects. IOSurface is a reference-counted CoreFoundation type whose
+// retain/release operations are thread-safe. The mutable fields `frame_count`,
+// `use_zero_copy`, `width`, and `height` are written only in `new` or `publish`
+// which should not be called concurrently (the caller must serialise publishes).
+// Sync is acceptable because all constituent types are individually safe to
+// access from shared references on concurrent threads.
 #[cfg(target_os = "macos")]
 unsafe impl Send for SyphonWgpuOutput {}
 #[cfg(target_os = "macos")]
 unsafe impl Sync for SyphonWgpuOutput {}
 
 impl SyphonWgpuOutput {
-    /// Create a new Syphon output for wgpu
-    /// 
-    /// This attempts to set up zero-copy GPU-to-GPU transfer. If the Metal interop
-    /// fails, it falls back to CPU readback.
-    /// 
-    /// # Arguments
-    /// * `name` - The name of the Syphon server (visible to clients)
-    /// * `wgpu_device` - The wgpu device used for rendering
-    /// * `wgpu_queue` - The wgpu queue used for rendering
-    /// * `width` - Frame width in pixels
-    /// * `height` - Frame height in pixels
+    /// Create a new Syphon output using the default [`SyphonOutputConfig`].
     pub fn new(
+        name: &str,
+        wgpu_device: &wgpu::Device,
+        wgpu_queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        Self::new_with_config(name, wgpu_device, wgpu_queue, width, height, SyphonOutputConfig::default())
+    }
+
+    /// Create a new Syphon output with explicit configuration.
+    ///
+    /// Use this when you need a non-default pool size (e.g. at >120 Hz).
+    pub fn new_with_config(
         name: &str,
         wgpu_device: &wgpu::Device,
         _wgpu_queue: &wgpu::Queue,
         width: u32,
         height: u32,
+        config: SyphonOutputConfig,
     ) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
-            Self::new_macos(name, wgpu_device, _wgpu_queue, width, height)
+            Self::new_macos(name, wgpu_device, _wgpu_queue, width, height, config)
         }
-        
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (name, wgpu_device, _wgpu_queue, width, height);
+            let _ = (name, wgpu_device, _wgpu_queue, width, height, config);
             Err(SyphonError::NotAvailable)
         }
     }
-    
+
     #[cfg(target_os = "macos")]
     fn new_macos(
         name: &str,
@@ -128,17 +181,10 @@ impl SyphonWgpuOutput {
         _wgpu_queue: &wgpu::Queue,
         width: u32,
         height: u32,
+        config: SyphonOutputConfig,
     ) -> Result<Self> {
-        // Try to get the Metal device from wgpu for zero-copy
-        let mut device_opt: Option<metal::Device> = None;
-        unsafe {
-            wgpu_device.as_hal::<wgpu_hal::api::Metal, _, _>(|hal_device| {
-                if let Some(dev) = hal_device {
-                    let raw = dev.raw_device().lock();
-                    device_opt = Some(raw.clone());
-                }
-            });
-        }
+        // Try to get the Metal device from wgpu for zero-copy.
+        let device_opt = metal_interop::extract_metal_device(wgpu_device);
         
         let use_zero_copy = device_opt.is_some();
         
@@ -148,12 +194,15 @@ impl SyphonWgpuOutput {
             let metal_device = device_opt.unwrap();
             let metal_queue = metal_device.new_command_queue();
             
-            // Create the Syphon server with the Metal device
+            // Create the Syphon server with the Metal device and server options.
             let device_ptr = metal_device.as_ref() as *const DeviceRef as *mut Object;
-            let server = SyphonServer::new_with_name_and_device(name, device_ptr, width, height)?;
+            let server = SyphonServer::new_with_name_and_device_and_options(
+                name, device_ptr, width, height, config.server_options.clone()
+            )?;
             
-            // Create an IOSurface pool for triple-buffering
-            let surface_pool = syphon_metal::IOSurfacePool::new(width, height, 3);
+            // Create an IOSurface pool sized by config.
+            let pool_size = config.pool_size.max(1);
+            let surface_pool = syphon_metal::IOSurfacePool::new(width, height, pool_size);
             
             log::info!(
                 "SyphonWgpuOutput created: {}x{} (zero-copy with {} IOSurfaces)",
@@ -182,9 +231,11 @@ impl SyphonWgpuOutput {
             let metal_queue = metal_device.new_command_queue();
             
             let device_ptr = metal_device.as_ref() as *const DeviceRef as *mut Object;
-            let server = SyphonServer::new_with_name_and_device(name, device_ptr, width, height)?;
+            let server = SyphonServer::new_with_name_and_device_and_options(
+                name, device_ptr, width, height, config.server_options.clone()
+            )?;
             
-            // Empty pool for fallback mode
+            // Fallback mode does not use the pool (CPU path allocates per-frame).
             let surface_pool = syphon_metal::IOSurfacePool::new(width, height, 0);
             
             log::info!("SyphonWgpuOutput created: {}x{} (CPU fallback)", width, height);
@@ -202,105 +253,99 @@ impl SyphonWgpuOutput {
         }
     }
     
-    /// Publish a texture to Syphon
-    /// 
-    /// This performs a zero-copy GPU-to-GPU transfer if possible,
-    /// falling back to CPU readback if necessary.
-    /// 
-    /// # Note
-    /// 
-    /// The texture should be in Bgra8Unorm format for best performance.
-    pub fn publish(&mut self, texture: &wgpu::Texture, device: &wgpu::Device, queue: &wgpu::Queue) {
+    /// Publish a texture to Syphon.
+    ///
+    /// Returns a [`PublishStatus`] indicating which path was used. Check it —
+    /// never assume zero-copy is active, especially after device changes.
+    ///
+    /// The texture must be in `Bgra8Unorm` format.
+    pub fn publish(
+        &mut self,
+        texture: &wgpu::Texture,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> PublishStatus {
         #[cfg(target_os = "macos")]
         {
             if self.server.client_count() == 0 {
-                return;
+                return PublishStatus::NoClients;
             }
-            
+
             self.frame_count += 1;
-            
+
             if self.use_zero_copy {
-                self.publish_zero_copy(texture, device, queue);
+                self.publish_zero_copy(texture, device, queue)
             } else {
                 self.publish_cpu_fallback(texture, device, queue);
+                PublishStatus::CpuFallback
             }
         }
+
+        #[cfg(not(target_os = "macos"))]
+        PublishStatus::NoClients
     }
     
     #[cfg(target_os = "macos")]
-    fn publish_zero_copy(&mut self, texture: &wgpu::Texture, _device: &wgpu::Device, queue: &wgpu::Queue) {
-        // Get an IOSurface from the pool
+    fn publish_zero_copy(
+        &mut self,
+        texture: &wgpu::Texture,
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> PublishStatus {
         let surface = match self.surface_pool.acquire() {
             Some(s) => s,
             None => {
-                log::warn!("No available IOSurfaces in pool, skipping frame");
-                return;
+                log::warn!(
+                    "[SyphonWgpuOutput] IOSurface pool exhausted — frame dropped. \
+                     Consider increasing pool_size in SyphonOutputConfig."
+                );
+                return PublishStatus::PoolExhausted;
             }
         };
-        
-        // We need to perform the blit on wgpu's queue to avoid synchronization issues
+
+        let mut published = false;
+
+        // Submit the blit on wgpu's own Metal queue so Metal's command-queue
+        // ordering guarantees it completes before subsequent wgpu render commands.
         unsafe {
-            queue.as_hal::<wgpu_hal::api::Metal, _, _>(|hal_queue| {
-                if let Some(mtl_queue) = hal_queue {
-                    let raw_queue = mtl_queue.as_raw().lock();
-                    
-                    // Get the raw Metal texture from wgpu
-                    texture.as_hal::<wgpu_hal::api::Metal, _, _>(|hal_tex| {
-                        if let Some(mtl_tex) = hal_tex {
-                            let src_texture = mtl_tex.raw_handle();
-                            
-                            // Create destination texture from IOSurface using raw Metal calls
-                            if let Some(ref metal_device) = self.metal_device {
-                                // Create texture from IOSurface using raw Objective-C
-                                let dest_texture = Self::create_iosurface_texture(
-                                    metal_device,
-                                    &surface,
-                                    self.width,
-                                    self.height
-                                );
-                                
-                                if let Some(dest_texture) = dest_texture {
-                                    // Create command buffer from wgpu's queue
-                                    let cmd_buf = raw_queue.new_command_buffer();
-                                    
-                                    // Simple blit - native BGRA
-                                    let blit = cmd_buf.new_blit_command_encoder();
-                                    blit.copy_from_texture(
-                                        src_texture,
-                                        0,  // source level
-                                        0,  // source slice
-                                        MTLOrigin { x: 0, y: 0, z: 0 },
-                                        MTLSize { 
-                                            width: self.width as u64, 
-                                            height: self.height as u64, 
-                                            depth: 1 
-                                        },
-                                        &dest_texture,
-                                        0,  // dest level
-                                        0,  // dest slice
-                                        MTLOrigin { x: 0, y: 0, z: 0 },
-                                    );
-                                    blit.end_encoding();
-                                    
-                                    // Publish to Syphon before committing
-                                    let texture_ptr = dest_texture.as_ptr() as *mut Object;
-                                    let cmd_buf_ptr = cmd_buf.as_ptr() as *mut Object;
-                                    self.server.publish_metal_texture(texture_ptr, cmd_buf_ptr);
-                                    
-                                    // Commit through wgpu's queue
-                                    cmd_buf.commit();
-                                }
-                            }
-                        }
-                    });
-                }
+            objc::rc::autoreleasepool(|| {
+                metal_interop::with_metal_queue_and_texture(queue, texture, |raw_queue, src_texture| {
+                    let Some(ref metal_device) = self.metal_device else { return };
+
+                    let Some(dest_texture) = Self::create_iosurface_texture(
+                        metal_device, &surface, self.width, self.height
+                    ) else { return };
+
+                    let cmd_buf = raw_queue.new_command_buffer();
+                    let blit = cmd_buf.new_blit_command_encoder();
+                    blit.copy_from_texture(
+                        src_texture,
+                        0, 0,
+                        MTLOrigin { x: 0, y: 0, z: 0 },
+                        MTLSize { width: self.width as u64, height: self.height as u64, depth: 1 },
+                        &dest_texture,
+                        0, 0,
+                        MTLOrigin { x: 0, y: 0, z: 0 },
+                    );
+                    blit.end_encoding();
+
+                    // Notify Syphon before committing so it can reference
+                    // the command buffer for synchronisation.
+                    let tex_ptr = dest_texture.as_ptr() as *mut Object;
+                    let cmd_ptr = cmd_buf.as_ptr() as *mut Object;
+                    self.server.publish_metal_texture(tex_ptr, cmd_ptr);
+
+                    cmd_buf.commit();
+                    published = true;
+                });
             });
         }
-        
-        // Return the surface to the pool
-        // Note: In production, we should wait for the GPU to finish before returning
-        // For now, triple-buffering gives us enough safety margin
+
+        // Triple-buffering ensures the GPU has finished with this surface before
+        // it's reused — return it even if publish failed so we don't leak it.
         self.surface_pool.release(surface);
+
+        if published { PublishStatus::ZeroCopy } else { PublishStatus::CpuFallback }
     }
     
     /// Create a Metal texture from an IOSurface using raw Objective-C

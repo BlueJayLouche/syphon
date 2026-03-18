@@ -19,6 +19,9 @@ pub enum SyphonError {
     
     /// Server with the given name was not found
     ServerNotFound(String),
+
+    /// Multiple servers match the given name — use connect_by_info() with a UUID
+    AmbiguousServerName(String),
     
     /// Invalid parameter was provided
     InvalidParameter(String),
@@ -62,6 +65,9 @@ impl fmt::Display for SyphonError {
             }
             SyphonError::ServerNotFound(name) => {
                 write!(f, "Syphon server '{}' not found", name)
+            }
+            SyphonError::AmbiguousServerName(name) => {
+                write!(f, "Multiple Syphon servers named '{}' — use connect_by_info() with a UUID for precise selection", name)
             }
             SyphonError::InvalidParameter(msg) => {
                 write!(f, "Invalid parameter: {}", msg)

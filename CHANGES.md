@@ -1,5 +1,116 @@
 # Syphon Crate Changelog
 
+## Version 0.4.0 (2026-03-18)
+
+### Performance and API Improvements
+
+A comprehensive overhaul focused on performance, correctness, and ergonomics. All changes are
+backward-compatible unless noted.
+
+#### New: Push-Based Frame Delivery
+
+`newFrameHandler` callbacks eliminate polling entirely:
+
+```rust
+// syphon-core
+let (client, rx) = SyphonClient::connect_with_channel("My App")?;
+let (client, rx) = SyphonClient::connect_by_info_with_channel(&info)?;
+
+// syphon-wgpu
+let rx = input.connect_with_channel("My App")?;
+let rx = input.connect_by_info_with_channel(&info)?;
+
+// rx.recv() wakes the thread exactly when a new frame is published
+while rx.recv().is_ok() {
+    if let Some(texture) = input.receive_texture(&device, &queue) { ... }
+}
+```
+
+The channel is a bounded `mpsc::sync_channel(1)` — signals are coalesced if the consumer
+is slower than the producer, so there is no unbounded backpressure.
+
+#### New: `PublishStatus` — No More Silent CPU Fallbacks
+
+`publish()` now returns an enum instead of `()`:
+
+```rust
+match output.publish(&texture, &device, &queue) {
+    PublishStatus::ZeroCopy    => { /* GPU-to-GPU blit, ~0% CPU */ }
+    PublishStatus::CpuFallback => log::warn!("falling back to CPU"),
+    PublishStatus::NoClients   => { /* no receivers connected */ }
+    PublishStatus::PoolExhausted => { /* increase SyphonOutputConfig::pool_size */ }
+}
+```
+
+#### New: UUID-Based Server Connection
+
+`connect()` now returns `SyphonError::AmbiguousServerName` when multiple servers share a
+name, instead of silently picking one. Use `connect_by_info()` for precision:
+
+```rust
+let servers = SyphonServerDirectory::servers();
+let info = servers.iter().find(|s| s.app_name == "Resolume").unwrap();
+SyphonClient::connect_by_info(info)?;   // matched by UUID
+```
+
+`SyphonServerDirectory::find_by_uuid(uuid)` is also available.
+
+#### New: `SyphonOutputConfig` and `ServerOptions`
+
+```rust
+let config = SyphonOutputConfig {
+    pool_size: 4,
+    server_options: ServerOptions { is_private: true },
+};
+SyphonWgpuOutput::new_with_config("Hidden", &device, &queue, w, h, config)?;
+```
+
+#### wgpu Input: Now Truly Zero-Copy
+
+`SyphonWgpuInput::receive_texture()` previously fell back to CPU readback.
+It now performs a GPU-to-GPU Metal blit (IOSurface → wgpu texture) with zero CPU
+involvement when the wgpu device is Metal-backed:
+
+```
+Before: IOSurface → CPU lock → write_texture (2 copies, ~5ms)
+After:  IOSurface ← Metal texture alias → blit to wgpu output (~0 CPU, ~1ms)
+```
+
+CPU fallback is retained for non-Metal backends and logged as a warning.
+
+#### Server Discovery: `requestServerAnnounce` Replaces Polling
+
+`SyphonServerDirectory::servers()` no longer sleeps for 1.5 seconds:
+
+- If servers are already registered, returns immediately
+- Otherwise sends `requestServerAnnounce` and spins the run loop for 200ms
+
+#### `metal_interop.rs`: wgpu-hal Isolation
+
+All `wgpu-hal` version-specific code is now in `syphon-wgpu/src/metal_interop.rs`.
+When upgrading wgpu, edit only that file and update the version banner.
+Current version: wgpu 25.0.
+
+#### Safety: Internalized Autorelease Pools
+
+All ObjC call sites now manage their own autorelease pools internally.
+Users no longer need to wrap Syphon calls in `objc::rc::autoreleasepool`.
+
+#### `// SAFETY:` Documentation
+
+All `unsafe impl Send/Sync` bounds now carry explicit `SAFETY:` comments.
+
+### Migration from 0.3.x
+
+- `publish()` return type changed from `()` to `PublishStatus`. Existing call sites
+  compile with a dead-code warning; add `let _ =` or match on the result.
+- `connect()` may now return `AmbiguousServerName` where it previously succeeded silently.
+  Switch to `connect_by_info()` in production code.
+- User-level `autoreleasepool` wrappers around Syphon calls are no longer required
+  (they remain harmless if present).
+
+---
+
 ## Version 0.3.0 (2024-03-13)
 
 ### API Cleanup and Simplification
@@ -8,13 +119,13 @@ This release streamlines the API by removing redundant components and focusing o
 
 #### Removed
 
-- **Y-flip compute shader** - Removed the Metal compute shader for Y-flip. Users should now render directly to BGRA8Unorm textures in the correct orientation.
-- **Input format variants** - Removed `input_fast.rs` and `input_optimized.rs`. Now only `input.rs` with native BGRA support.
-- **BGRA to RGBA conversion** - Removed GPU conversion. The API now uses native BGRA8Unorm throughout.
-- **Redundant examples** - Removed 11 example files, keeping only the essential 3:
-  - `wgpu_sender.rs` - wgpu output example
-  - `metal_client.rs` - Zero-copy Metal client
-  - `simple_client.rs` - Basic client example
+- **Y-flip compute shader** — Removed the Metal compute shader for Y-flip. Users should now render directly to BGRA8Unorm textures in the correct orientation.
+- **Input format variants** — Removed `input_fast.rs` and `input_optimized.rs`. Now only `input.rs` with native BGRA support.
+- **BGRA to RGBA conversion** — Removed GPU conversion. The API now uses native BGRA8Unorm throughout.
+- **Redundant examples** — Reduced to 3 essential examples:
+  - `wgpu_sender.rs` — wgpu output example
+  - `metal_client.rs` — Zero-copy Metal client
+  - `simple_client.rs` — Basic client example
 
 #### Simplified API
 
@@ -30,39 +141,6 @@ let mut input = SyphonWgpuInput::new(&device, &queue);
 // Textures are always Bgra8Unorm
 ```
 
-#### Migration
-
-1. **Update input usage:**
-   ```rust
-   // Remove format configuration
-   // input.set_format(...);  // No longer exists
-   
-   // Textures are always Bgra8Unorm
-   let texture = input.receive_texture(&device, &queue);
-   ```
-
-2. **Update rendering:**
-   ```rust
-   // Ensure your render target uses Bgra8Unorm
-   let texture = device.create_texture(&wgpu::TextureDescriptor {
-       format: wgpu::TextureFormat::Bgra8Unorm,
-       // ...
-   });
-   ```
-
-3. **Check examples:**
-   Many example files were removed. Update your references:
-   - `wgpu_sender.rs` (still available)
-   - `metal_client.rs` (still available)
-   - `simple_client.rs` (still available)
-
-### Documentation Updates
-
-- Updated README with simplified API
-- Updated ZERO_COPY_IMPLEMENTATION.md
-- Removed MIGRATION_GUIDE.md (no longer needed for new API)
-- Simplified DOCUMENTATION_INDEX.md
-
 ---
 
 ## Version 0.2.0 (2024-03-07)
@@ -74,149 +152,24 @@ let mut input = SyphonWgpuInput::new(&device, &queue);
 **Problem:** Applications were crashing with:
 - `objc[PID]: Attempt to use unknown class 0x...`
 - `zsh: segmentation fault`
-- `zsh: abort`
 
-**Root Cause:** Missing `autoreleasepool` blocks around Objective-C calls. When temporary Objective-C objects are created (like Syphon server lists, frame images), they're added to an autorelease pool. Without a pool, these objects become invalid and accessing them causes crashes.
+**Root Cause:** Missing `autoreleasepool` blocks around Objective-C calls.
 
-**Solution:** Added `autoreleasepool` wrappers to all Objective-C interop code:
-
-- `directory.rs` - Server discovery
-- `client.rs` - Client creation, frame receiving, connection checking
-- `server.rs` - Texture publishing, client counting, server stopping
-
-**Migration:**
-If you have background threads using Syphon, wrap them:
-
-```rust
-use objc::rc::autoreleasepool;
-
-thread::spawn(move || {
-    autoreleasepool(|| {
-        let client = SyphonClient::connect("Server").unwrap();
-        // ... use client
-    });
-});
-```
+**Solution:** Added `autoreleasepool` wrappers to all Objective-C interop code in
+`directory.rs`, `client.rs`, and `server.rs`.
 
 ### Improvements
 
-#### Better Error Messages
+- Better error messages for framework-not-found and GPU compatibility issues
+- `metal_device.rs`: `available_devices()`, `recommended_high_performance_device()`,
+  `check_device_compatibility()`, `validate_device_match()`
 
-Added detailed error messages for common issues:
-- Framework not found with installation instructions
-- Incorrect install name detection with fix command
-- GPU device compatibility warnings
-
-#### GPU Device Utilities (New)
-
-Added `metal_device.rs` module with:
-- `available_devices()` - List all Metal GPUs
-- `recommended_high_performance_device()` - Select best GPU
-- `check_device_compatibility()` - Validate device support
-- `validate_device_match()` - Check render/Syphon GPU match
-
-#### Server Creation Fallback
-
-Added `new_with_framework_device()` method that uses Syphon's internal device creation. This provides a fallback when framework loading issues occur.
-
-### API Changes
-
-#### Added
-
-```rust
-// Server
-impl SyphonServer {
-    pub fn new_with_framework_device(name, width, height) -> Result<Self>;
-}
-
-// Device utilities
-pub fn available_devices() -> Vec<MetalDeviceInfo>;
-pub fn recommended_high_performance_device() -> Option<MetalDeviceInfo>;
-pub fn check_device_compatibility(device) -> Result<()>;
-pub fn validate_device_match(render_device, syphon_device) -> Result<()>;
-```
-
-#### Deprecated
-
-```rust
-// No deprecations in this release
-```
+---
 
 ## Version 0.1.0 (2024-03-01)
 
 ### Initial Release
 
-#### Features
-
-- **syphon-core**: Core Objective-C bindings
-  - `SyphonServer` - Publish frames
-  - `SyphonClient` - Receive frames  
-  - `SyphonServerDirectory` - Server discovery
-  
-- **syphon-wgpu**: wgpu integration
-  - `SyphonWgpuOutput` - Zero-copy wgpu output
-  - Automatic Y-flip handling
-  - IOSurface-backed textures
-
-- **syphon-metal**: Metal utilities
-  - `IOSurfacePool` - Triple-buffering surface pool
-  - Metal device helpers
-
-#### Known Issues
-
-- Requires manual framework installation
-- Background threads may crash without autoreleasepool (fixed in 0.2.0)
-- Multi-GPU systems need careful device selection
-
-## Migration Guides
-
-### Upgrading from 0.1.0 to 0.2.0
-
-1. **Update dependencies** - No changes needed
-
-2. **Add autoreleasepool to background threads:**
-   ```rust
-   // Before (may crash)
-   thread::spawn(|| {
-       let client = SyphonClient::connect("Server").unwrap();
-   });
-   
-   // After (safe)
-   use objc::rc::autoreleasepool;
-   thread::spawn(|| {
-       autoreleasepool(|| {
-           let client = SyphonClient::connect("Server").unwrap();
-       });
-   });
-   ```
-
-3. **Consider using framework fallback if needed:**
-   ```rust
-   // Try standard method first
-   let result = SyphonServer::new(name, width, height);
-   
-   // Fall back to framework device
-   let server = match result {
-       Ok(s) => s,
-       Err(SyphonError::FrameworkNotFound(_)) => {
-           SyphonServer::new_with_framework_device(name, width, height)?
-       }
-       Err(e) => return Err(e),
-   };
-   ```
-
-## Future Plans
-
-### Version 0.3.0 (Planned)
-
-- [ ] Spout support for Windows
-- [ ] v4l2loopback support for Linux
-- [ ] Async/await API
-- [ ] Better error recovery
-- [ ] Performance metrics
-
-### Long Term
-
-- [ ] Unified cross-platform API
-- [ ] Vulkan support
-- [ ] DirectX 12 support
+- `syphon-core`: `SyphonServer`, `SyphonClient`, `SyphonServerDirectory`
+- `syphon-wgpu`: `SyphonWgpuOutput`, zero-copy send path, IOSurface-backed textures
+- `syphon-metal`: `IOSurfacePool`, Metal device helpers

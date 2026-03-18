@@ -133,8 +133,11 @@ fn run() {
         
         queue.submit(std::iter::once(encoder.finish()));
         
-        // Publish to Syphon (zero-copy GPU blit)
-        syphon_output.publish(&output_texture, &device, &queue);
+        // Publish to Syphon — check status to confirm zero-copy is active.
+        let status = syphon_output.publish(&output_texture, &device, &queue);
+        if matches!(status, syphon_wgpu::PublishStatus::CpuFallback) {
+            log::warn!("Syphon is using CPU fallback — check Metal interop setup");
+        }
         
         frame_count += 1;
         

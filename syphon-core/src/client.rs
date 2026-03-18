@@ -1,12 +1,10 @@
 //! Syphon Client - Receives frames from a Syphon server
-//!
-//! This wraps the Objective-C SyphonClient class
 
 use crate::{Result, SyphonError};
+use crate::directory::ServerInfo;
 
 #[cfg(target_os = "macos")]
 use core_foundation::base::TCFType;
-
 #[cfg(target_os = "macos")]
 use objc::runtime::{Class, Object};
 #[cfg(target_os = "macos")]
@@ -16,439 +14,517 @@ use objc_id::ShareId;
 
 /// A frame received from a Syphon server
 pub struct Frame {
-    /// The IOSurface containing the frame data
     #[cfg(target_os = "macos")]
     pub(crate) surface: io_surface::IOSurface,
-    /// Frame dimensions
     pub width: u32,
     pub height: u32,
 }
 
 impl Frame {
-    /// Get the IOSurface ID
     #[cfg(target_os = "macos")]
     pub fn iosurface_id(&self) -> io_surface::IOSurfaceID {
         self.surface.get_id()
     }
-    
-    /// Get a reference to the underlying IOSurface
-    /// 
-    /// This allows zero-copy access to the frame data by creating a Metal texture
-    /// directly from the IOSurface.
+
+    /// Zero-copy access: create a Metal texture directly from this surface.
     #[cfg(target_os = "macos")]
     pub fn iosurface(&self) -> &io_surface::IOSurface {
         &self.surface
     }
-    
-    /// Get the raw IOSurface reference
-    /// 
-    /// # Safety
-    /// The returned pointer is only valid as long as this Frame exists.
-    /// The caller must not release or modify the surface.
+
     #[cfg(target_os = "macos")]
     pub fn iosurface_ref(&self) -> io_surface::IOSurfaceRef {
         self.surface.as_concrete_TypeRef()
     }
-    
-    /// Lock the surface for reading (returns base address and seed)
-    /// 
-    /// Don't forget to unlock when done! Use the returned seed for unlock.
+
+    /// Lock the surface for CPU reading. Returns `(base_addr, seed)`.
+    /// Must be paired with [`unlock`](Frame::unlock).
     #[cfg(target_os = "macos")]
     pub fn lock(&mut self) -> Result<(*mut u8, u32)> {
         use crate::iosurface_ext::{IOSurfaceLock, kIOSurfaceLockReadOnly, kIOSurfaceLockAvoidSync};
-        
+
         unsafe {
             let surface_ref = self.surface.as_CFTypeRef() as io_surface::IOSurfaceRef;
             let mut seed = 0u32;
-            
-            // Try with read-only flag first
+
             let result = IOSurfaceLock(surface_ref, kIOSurfaceLockReadOnly, &mut seed);
-            
             if result != 0 {
-                log::debug!("[Syphon Frame] IOSurfaceLock failed with error code: {}. Retrying with avoid sync...", result);
-                
-                // Try with avoid sync flag as fallback
-                let result2 = IOSurfaceLock(surface_ref, kIOSurfaceLockReadOnly | kIOSurfaceLockAvoidSync, &mut seed);
+                let result2 = IOSurfaceLock(
+                    surface_ref,
+                    kIOSurfaceLockReadOnly | kIOSurfaceLockAvoidSync,
+                    &mut seed,
+                );
                 if result2 != 0 {
-                    log::warn!("[Syphon Frame] IOSurfaceLock retry failed with error code: {}", result2);
                     return Err(SyphonError::LockFailed);
                 }
             }
-            
+
             let addr = crate::iosurface_ext::IOSurfaceGetBaseAddress(surface_ref);
-            
             if addr.is_null() {
-                log::error!("[Syphon Frame] IOSurfaceGetBaseAddress returned null");
                 let _ = self.unlock(seed);
                 return Err(SyphonError::LockFailed);
             }
-            
+
             Ok((addr as *mut u8, seed))
         }
     }
-    
-    /// Unlock the surface with the seed from lock
+
     #[cfg(target_os = "macos")]
     pub fn unlock(&mut self, seed: u32) -> Result<()> {
         use crate::iosurface_ext::IOSurfaceUnlock;
-        
+
         unsafe {
             let surface_ref = self.surface.as_CFTypeRef() as io_surface::IOSurfaceRef;
             let mut seed_copy = seed;
-            
             let result = IOSurfaceUnlock(surface_ref, 0, &mut seed_copy);
-            
             if result != 0 {
-                // Log at trace level only - this happens frequently with some servers
-                // and doesn't affect functionality since we've already copied the data
-                log::trace!("[Syphon Frame] IOSurfaceUnlock failed with error code: {} (ignoring)", result);
+                log::trace!("[Frame] IOSurfaceUnlock failed ({}), ignoring", result);
                 return Err(SyphonError::LockFailed);
             }
-            
             Ok(())
         }
     }
-    
-    /// Get the bytes per row (stride)
+
     #[cfg(target_os = "macos")]
     pub fn bytes_per_row(&self) -> usize {
         use crate::iosurface_ext::IOSurfaceGetBytesPerRow;
-        
         unsafe {
             IOSurfaceGetBytesPerRow(self.surface.as_CFTypeRef() as io_surface::IOSurfaceRef)
         }
     }
-    
-    /// Copy frame data to a Vec<u8>
+
+    /// CPU-copy the frame data into a `Vec<u8>`.
     #[cfg(target_os = "macos")]
     pub fn to_vec(&mut self) -> Result<Vec<u8>> {
         use std::slice;
-        
-        // Try to lock the surface and get the seed
-        let (addr, seed) = match self.lock() {
-            Ok(result) => result,
-            Err(e) => {
-                log::error!("[Syphon Frame] Failed to lock IOSurface: {:?}", e);
-                return Err(e);
-            }
-        };
-        
+
+        let (addr, seed) = self.lock()?;
         let height = self.height as usize;
         let stride = self.bytes_per_row();
-        let size = height * stride;
-        
-        log::trace!("[Syphon Frame] Locked surface (seed={}), copying {} bytes ({}x{}, stride={})", 
-            seed, size, self.width, self.height, stride);
-        
+
         unsafe {
-            let data = slice::from_raw_parts(addr, size);
-            let result = data.to_vec();
-            
-            // Try to unlock the surface with the same seed
-            // Note: Unlock can fail if the surface was already unlocked or
-            // if there's a synchronization issue, but we've already copied the data
-            if let Err(_) = self.unlock(seed) {
-                // Silently ignore unlock errors - the data is already copied
-                // This happens frequently with some Syphon servers and doesn't affect functionality
-            }
-            
-            log::trace!("[Syphon Frame] Successfully copied frame data");
-            Ok(result)
+            let data = slice::from_raw_parts(addr, height * stride).to_vec();
+            let _ = self.unlock(seed);
+            Ok(data)
         }
     }
 }
 
-/// A Syphon client that receives frames from a server
+// ---------------------------------------------------------------------------
+
+/// Wraps `block::RcBlock` to make it `Send + Sync`.
+///
+/// SAFETY: The block captures only `SyncSender<()>`, which is `Send + Sync`.
+/// The Syphon framework may fire the handler from any thread, so the block
+/// itself must be `Send`. We never invoke the block concurrently from Rust —
+/// only the framework does — so `Sync` is also sound.
+#[cfg(target_os = "macos")]
+struct FrameHandlerBlock(
+    block::RcBlock<(*mut objc::runtime::Object,), ()>,
+);
+#[cfg(target_os = "macos")]
+unsafe impl Send for FrameHandlerBlock {}
+#[cfg(target_os = "macos")]
+unsafe impl Sync for FrameHandlerBlock {}
+
+/// A Syphon client that receives frames from a named server.
 pub struct SyphonClient {
     #[cfg(target_os = "macos")]
     inner: ShareId<Object>,
-    
-    server_name: String,
-    server_app: String,
+    info: ServerInfo,
+    /// Keeps the ObjC block alive for the lifetime of the client.
+    /// Only set when the client was created via `connect_with_channel`.
+    #[cfg(target_os = "macos")]
+    _handler_block: Option<Box<dyn std::any::Any>>,
 }
 
+// SAFETY: `SyphonMetalClient` is backed by an ARC-managed ObjC object.
+// The Syphon framework documents that `newFrameHandler` blocks may fire on
+// any thread, implying the client's internal state is protected under a lock.
+// The selectors we call — `hasNewFrame`, `newSurface`, `newFrameImage`,
+// `isValid`, `stop` — are all safe to invoke from any thread.
+// `info` is a plain Rust value written once at construction and never mutated.
+// Sync: all our ObjC calls are individually thread-safe, so concurrent shared
+// references (e.g. two threads calling `has_new_frame()`) are sound.
 #[cfg(target_os = "macos")]
 unsafe impl Send for SyphonClient {}
 #[cfg(target_os = "macos")]
 unsafe impl Sync for SyphonClient {}
 
 impl SyphonClient {
-    /// Connect to a Syphon server by name
+    /// Connect to a server by display name or app name.
     ///
-    /// Matches against both the server's `name` and `app_name` fields. This handles
-    /// servers with empty names (like the official "Simple Server" app) that only
-    /// have an `app_name`.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use syphon_core::SyphonClient;
-    ///
-    /// // These both work:
-    /// // - "Resolume Arena" (matches name)
-    /// // - "Simple Server" (matches app_name, since name is empty)
-    /// let client = SyphonClient::connect("Simple Server")?;
-    /// if let Some(frame) = client.receive_frame()? {
-    ///     // Use frame...
-    /// }
-    /// ```
+    /// Returns [`SyphonError::AmbiguousServerName`] when multiple servers share
+    /// the same name. In that case call [`connect_by_info`](Self::connect_by_info)
+    /// after listing servers with [`SyphonServerDirectory::servers()`].
     pub fn connect(server_name: &str) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
-            Self::connect_macos(server_name)
+            unsafe { objc::rc::autoreleasepool(|| Self::connect_by_name_macos(server_name)) }
         }
-        
         #[cfg(not(target_os = "macos"))]
-        {
-            Err(SyphonError::NotAvailable)
-        }
+        { Err(SyphonError::NotAvailable) }
     }
-    
-    #[cfg(target_os = "macos")]
-    fn connect_macos(server_name: &str) -> Result<Self> {
-        use crate::utils::{to_nsstring, from_nsstring};
-        use objc::rc::autoreleasepool;
-        
-        unsafe {
-            autoreleasepool(|| {
-                // Get SyphonServerDirectory
-                let dir_cls = Class::get("SyphonServerDirectory")
-                    .ok_or_else(|| SyphonError::FrameworkNotFound(
-                        "SyphonServerDirectory not found".to_string()
-                    ))?;
-                let dir: *mut Object = msg_send![dir_cls, sharedDirectory];
-                
-                // Request server announcements
-                let _: () = msg_send![dir, requestServerAnnounce];
-                
-                // Poll for servers with run loop processing
-                // Note: serversMatchingName:appName: doesn't always work, so we use servers
-                let mut server_desc: *mut Object = std::ptr::null_mut();
-                
-                for attempt in 0..30 {
-                    // Process run loop to receive distributed notifications
-                    let run_loop: *mut Object = msg_send![Class::get("NSRunLoop").unwrap(), currentRunLoop];
-                    let date: *mut Object = msg_send![Class::get("NSDate").unwrap(), dateWithTimeIntervalSinceNow:0.05];
-                    let _: () = msg_send![run_loop, runUntilDate:date];
-                    
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    
-                    // Get all servers and look for match by name OR app name
-                    let servers: *mut Object = msg_send![dir, servers];
-                    let count: usize = msg_send![servers, count];
-                    
-                    log::debug!("Attempt {}: found {} servers", attempt + 1, count);
-                    
-                    for i in 0..count {
-                        let desc: *mut Object = msg_send![servers, objectAtIndex:i];
-                        let name = Self::get_string_from_desc(desc, "SyphonServerDescriptionNameKey");
-                        let app = Self::get_string_from_desc(desc, "SyphonServerDescriptionAppNameKey");
-                        
-                        log::debug!("  Server {}: name='{}', app='{}'", i, name, app);
-                        
-                        // Match by name OR by app name (Simple Server has empty name)
-                        if name == server_name || app == server_name {
-                            server_desc = desc;
-                            let _: () = msg_send![server_desc, retain];
-                            break;
-                        }
-                    }
-                    
-                    if !server_desc.is_null() {
-                        break;
-                    }
-                }
-                
-                if server_desc.is_null() {
-                    return Err(SyphonError::ServerNotFound(
-                        server_name.to_string()
-                    ));
-                }
-                
-                // Get server info before we potentially move the description
-                let name = Self::get_string_from_desc(server_desc, "SyphonServerDescriptionNameKey");
-                let app = Self::get_string_from_desc(server_desc, "SyphonServerDescriptionAppNameKey");
-                
-                log::info!("Connecting to server: '{}' from '{}'", name, app);
-                
-                // Get the default Metal device
-                let device = crate::metal_device::default_device()
-                    .map(|info| info.raw_device)
-                    .ok_or_else(|| SyphonError::FrameworkNotFound(
-                        "Metal not available - cannot create Syphon client".to_string()
-                    ))?;
-                
-                // Get SyphonMetalClient class (Metal client is easier to set up than OpenGL)
-                let cls = Class::get("SyphonMetalClient")
-                    .ok_or_else(|| SyphonError::FrameworkNotFound(
-                        "SyphonMetalClient class not found".to_string()
-                    ))?;
-                
-                // Create the client with Rust-level panic catching
-                let create_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let obj: *mut Object = msg_send![cls, alloc];
-                    let obj: *mut Object = msg_send![
-                        obj,
-                        initWithServerDescription: server_desc
-                        device: device
-                        options: std::ptr::null_mut::<Object>()
-                        newFrameHandler: std::ptr::null_mut::<Object>()
-                    ];
-                    obj
-                }));
-                
-                // Release the server description (we retained it when we found it)
-                let _: () = msg_send![server_desc, release];
-                
-                let obj = match create_result {
-                    Ok(obj) => obj,
-                    Err(_) => {
-                        log::error!("SyphonMetalClient init panicked (likely threw Objective-C exception)");
-                        return Err(SyphonError::CreateFailed(
-                            "SyphonMetalClient initialization failed - server may be invalid".to_string()
-                        ));
-                    }
-                };
-                
-                if obj.is_null() {
-                    return Err(SyphonError::CreateFailed(
-                        "Failed to create SyphonClient".to_string()
-                    ));
-                }
-                
-                // Check if client is valid
-                let is_valid: bool = msg_send![obj, isValid];
-                if !is_valid {
-                    return Err(SyphonError::CreateFailed(
-                        "Client is not valid - server may have stopped".to_string()
-                    ));
-                }
-                
-                let inner = ShareId::from_ptr(obj);
-                
-                Ok(Self {
-                    inner,
-                    server_name: name,
-                    server_app: app,
-                })
-            })
-        }
-    }
-    
-    /// Helper to get string from server description dictionary
-    #[cfg(target_os = "macos")]
-    unsafe fn get_string_from_desc(desc: *mut Object, key: &str) -> String {
-        use crate::utils::{to_nsstring, from_nsstring};
-        
-        let key_obj = match to_nsstring(key) {
-            Ok(k) => k,
-            Err(_) => return String::new(),
-        };
-        
-        // Use objectForKey: with the actual constant key string
-        let value: *mut Object = msg_send![desc, objectForKey:key_obj];
-        
-        if value.is_null() {
-            String::new()
-        } else {
-            from_nsstring(value)
-        }
-    }
-    
-    /// Try to receive a frame (non-blocking)
+
+    /// Connect using a [`ServerInfo`] obtained from [`SyphonServerDirectory`].
     ///
-    /// Returns None if no new frame is available
+    /// Matches by UUID — the only unambiguous identifier. Prefer this over
+    /// `connect()` in any production code that might encounter multiple servers.
+    pub fn connect_by_info(info: &ServerInfo) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe { objc::rc::autoreleasepool(|| Self::connect_by_info_macos(info)) }
+        }
+        #[cfg(not(target_os = "macos"))]
+        { Err(SyphonError::NotAvailable) }
+    }
+
+    /// Connect with push-based frame delivery via a channel.
+    ///
+    /// Returns `(client, receiver)`. The receiver yields `()` each time the
+    /// server publishes a new frame, using the Syphon `newFrameHandler` block —
+    /// no CPU polling. Call [`try_receive`](Self::try_receive) after waking.
+    ///
+    /// The signal fires on an arbitrary thread; do not call `try_receive`
+    /// from inside a handler registered elsewhere.
+    ///
+    /// The channel closes automatically when the client is dropped or the
+    /// server stops.
+    pub fn connect_with_channel(
+        server_name: &str,
+    ) -> Result<(Self, std::sync::mpsc::Receiver<()>)> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        #[cfg(target_os = "macos")]
+        {
+            let client = unsafe {
+                objc::rc::autoreleasepool(|| Self::connect_by_name_with_tx(server_name, Some(tx)))
+            }?;
+            Ok((client, rx))
+        }
+        #[cfg(not(target_os = "macos"))]
+        { Err(SyphonError::NotAvailable) }
+    }
+
+    /// Connect by [`ServerInfo`] with push-based frame delivery via a channel.
+    ///
+    /// UUID-based; prefer this over [`connect_with_channel`](Self::connect_with_channel)
+    /// when multiple servers might share a name.
+    pub fn connect_by_info_with_channel(
+        info: &ServerInfo,
+    ) -> Result<(Self, std::sync::mpsc::Receiver<()>)> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        #[cfg(target_os = "macos")]
+        {
+            let client = unsafe {
+                objc::rc::autoreleasepool(|| Self::connect_by_info_with_tx(info, Some(tx)))
+            }?;
+            Ok((client, rx))
+        }
+        #[cfg(not(target_os = "macos"))]
+        { Err(SyphonError::NotAvailable) }
+    }
+
+    // -----------------------------------------------------------------------
+    // macOS internals
+    // -----------------------------------------------------------------------
+
+    /// Acquire the shared SyphonServerDirectory instance.
+    #[cfg(target_os = "macos")]
+    unsafe fn shared_dir() -> Result<*mut Object> {
+        Class::get("SyphonServerDirectory")
+            .map(|cls| { let dir: *mut Object = msg_send![cls, sharedDirectory]; dir })
+            .ok_or_else(|| SyphonError::FrameworkNotFound(
+                "SyphonServerDirectory not found".to_string()
+            ))
+    }
+
+    /// If `dir.servers` is empty, send `requestServerAnnounce` and spin the
+    /// run loop for 200 ms so incoming NSNotifications can be delivered.
+    #[cfg(target_os = "macos")]
+    unsafe fn ensure_servers_populated(dir: *mut Object) {
+        use objc::rc::autoreleasepool;
+
+        let servers: *mut Object = msg_send![dir, servers];
+        let count: usize = msg_send![servers, count];
+        if count > 0 { return; }
+
+        let _: () = msg_send![dir, requestServerAnnounce];
+
+        autoreleasepool(|| {
+            let run_loop: *mut Object =
+                msg_send![Class::get("NSRunLoop").unwrap(), currentRunLoop];
+            let deadline: *mut Object = msg_send![
+                Class::get("NSDate").unwrap(),
+                dateWithTimeIntervalSinceNow: 0.2f64
+            ];
+            let _: () = msg_send![run_loop, runUntilDate: deadline];
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe fn connect_by_name_macos(name: &str) -> Result<Self> {
+        Self::connect_by_name_with_tx(name, None)
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe fn connect_by_info_macos(info: &ServerInfo) -> Result<Self> {
+        Self::connect_by_info_with_tx(info, None)
+    }
+
+    /// Internal: find a server by name/app-name, then create a client.
+    /// `tx` is `Some` when push delivery is requested.
+    #[cfg(target_os = "macos")]
+    unsafe fn connect_by_name_with_tx(
+        name: &str,
+        tx: Option<std::sync::mpsc::SyncSender<()>>,
+    ) -> Result<Self> {
+        let dir = Self::shared_dir()?;
+        Self::ensure_servers_populated(dir);
+
+        let servers: *mut Object = msg_send![dir, servers];
+        let count: usize = msg_send![servers, count];
+
+        let mut first_match: *mut Object = std::ptr::null_mut();
+        let mut first_info: Option<ServerInfo> = None;
+        let mut match_count = 0usize;
+
+        for i in 0..count {
+            let desc: *mut Object = msg_send![servers, objectAtIndex: i];
+            let n = Self::str_from_desc(desc, "SyphonServerDescriptionNameKey");
+            let a = Self::str_from_desc(desc, "SyphonServerDescriptionAppNameKey");
+
+            if n == name || a == name {
+                match_count += 1;
+                if first_match.is_null() {
+                    let u = Self::str_from_desc(desc, "SyphonServerDescriptionUUIDKey");
+                    let b = Self::str_from_desc(desc, "SyphonServerDescriptionAppBundleIdentifierKey");
+                    let _: () = msg_send![desc, retain];
+                    first_match = desc;
+                    first_info = Some(ServerInfo { name: n, uuid: u, app_name: a, bundle_id: b });
+                }
+            }
+        }
+
+        if first_match.is_null() {
+            return Err(SyphonError::ServerNotFound(name.to_string()));
+        }
+
+        if match_count > 1 {
+            let _: () = msg_send![first_match, release];
+            return Err(SyphonError::AmbiguousServerName(format!(
+                "{} servers match name '{}'. \
+                 List servers with SyphonServerDirectory::servers() and call connect_by_info().",
+                match_count, name
+            )));
+        }
+
+        let info = first_info.unwrap();
+        log::info!("[SyphonClient] Connecting to '{}' (uuid={})", info.display_name(), info.uuid);
+        let result = Self::create_client(first_match, info, tx);
+        let _: () = msg_send![first_match, release];
+        result
+    }
+
+    /// Internal: find a server by UUID, then create a client.
+    #[cfg(target_os = "macos")]
+    unsafe fn connect_by_info_with_tx(
+        info: &ServerInfo,
+        tx: Option<std::sync::mpsc::SyncSender<()>>,
+    ) -> Result<Self> {
+        let dir = Self::shared_dir()?;
+        Self::ensure_servers_populated(dir);
+
+        let servers: *mut Object = msg_send![dir, servers];
+        let count: usize = msg_send![servers, count];
+        let mut found: *mut Object = std::ptr::null_mut();
+
+        for i in 0..count {
+            let desc: *mut Object = msg_send![servers, objectAtIndex: i];
+            let u = Self::str_from_desc(desc, "SyphonServerDescriptionUUIDKey");
+            if u == info.uuid {
+                let _: () = msg_send![desc, retain];
+                found = desc;
+                break;
+            }
+        }
+
+        if found.is_null() {
+            return Err(SyphonError::ServerNotFound(format!("uuid={}", info.uuid)));
+        }
+
+        log::info!("[SyphonClient] Connecting to '{}' (uuid={})", info.display_name(), info.uuid);
+        let result = Self::create_client(found, info.clone(), tx);
+        let _: () = msg_send![found, release];
+        result
+    }
+
+    /// Build a `SyphonMetalClient` from a retained server description pointer.
+    ///
+    /// When `tx` is `Some`, an ObjC block is created that signals the sender
+    /// on every new frame (via `newFrameHandler:`). The block is stored on the
+    /// struct so it is kept alive until the client is dropped.
+    #[cfg(target_os = "macos")]
+    unsafe fn create_client(
+        server_desc: *mut Object,
+        info: ServerInfo,
+        tx: Option<std::sync::mpsc::SyncSender<()>>,
+    ) -> Result<Self> {
+        let device = crate::metal_device::default_device()
+            .map(|d| d.raw_device)
+            .ok_or_else(|| SyphonError::FrameworkNotFound("Metal not available".to_string()))?;
+
+        let cls = Class::get("SyphonMetalClient")
+            .ok_or_else(|| SyphonError::FrameworkNotFound(
+                "SyphonMetalClient class not found".to_string()
+            ))?;
+
+        // Build the ObjC block if the caller wants push delivery.
+        // The block captures a SyncSender<()> and calls try_send on every frame.
+        // We wrap it in FrameHandlerBlock (Send+Sync) so it can live in the struct.
+        let (handler_ptr, handler_block): (*mut Object, Option<Box<dyn std::any::Any>>) =
+            match tx {
+                Some(sender) => {
+                    let blk = block::ConcreteBlock::new(move |_client: *mut Object| {
+                        // Non-blocking: drop the signal if the receiver is full or gone.
+                        let _ = sender.try_send(());
+                    }).copy();
+                    let ptr = &*blk as *const _ as *mut Object;
+                    (ptr, Some(Box::new(FrameHandlerBlock(blk))))
+                }
+                None => (std::ptr::null_mut(), None),
+            };
+
+        let init_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let obj: *mut Object = msg_send![cls, alloc];
+            let obj: *mut Object = msg_send![
+                obj,
+                initWithServerDescription: server_desc
+                device: device
+                options: std::ptr::null_mut::<Object>()
+                newFrameHandler: handler_ptr
+            ];
+            obj
+        }));
+
+        let obj = match init_result {
+            Ok(o) => o,
+            Err(_) => return Err(SyphonError::CreateFailed(
+                "SyphonMetalClient init threw an Objective-C exception".to_string()
+            )),
+        };
+
+        if obj.is_null() {
+            return Err(SyphonError::CreateFailed("SyphonMetalClient returned nil".to_string()));
+        }
+
+        let is_valid: bool = msg_send![obj, isValid];
+        if !is_valid {
+            return Err(SyphonError::CreateFailed(
+                "SyphonMetalClient.isValid is false — server may have stopped".to_string()
+            ));
+        }
+
+        Ok(Self { inner: ShareId::from_ptr(obj), info, _handler_block: handler_block })
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe fn str_from_desc(desc: *mut Object, key: &str) -> String {
+        use crate::utils::{to_nsstring, from_nsstring};
+        let k = match to_nsstring(key) { Ok(k) => k, Err(_) => return String::new() };
+        let v: *mut Object = msg_send![desc, objectForKey: k];
+        if v.is_null() { String::new() } else { from_nsstring(v) }
+    }
+
+    // -----------------------------------------------------------------------
+    // Public API
+    // -----------------------------------------------------------------------
+
+    /// Non-blocking frame poll. Returns `None` when no new frame is available.
+    ///
+    /// Safe to call from any thread — autorelease pool is managed internally.
     #[cfg(target_os = "macos")]
     pub fn try_receive(&self) -> Result<Option<Frame>> {
         unsafe {
-            // Check if we have a new frame
-            let has_new_frame: bool = msg_send![
-                &*self.inner,
-                hasNewFrame
-            ];
-            
-            if !has_new_frame {
-                return Ok(None);
-            }
-            
-            // Get the IOSurface first (before consuming the frame)
-            // newSurface returns the same IOSurface that will be used for the texture
-            let surface: *mut Object = msg_send![&*self.inner, newSurface];
-            
-            if surface.is_null() {
-                return Ok(None);
-            }
-            
-            // Retain the surface immediately (we'll own it)
-            let _: () = msg_send![surface, retain];
-            
-            // For SyphonMetalClient, we must call newFrameImage to consume the frame
-            // and reset the hasNewFrame flag. This returns a texture that wraps the IOSurface.
-            let texture: *mut Object = msg_send![&*self.inner, newFrameImage];
-            if !texture.is_null() {
-                // Release the texture - we don't need it since we already retained the surface
-                let _: () = msg_send![texture, release];
-            }
-            
-            // Get dimensions from IOSurface
-            use crate::iosurface_ext::{IOSurfaceGetHeight, IOSurfaceGetBytesPerRow, IOSurfaceGetWidth};
-            let height = IOSurfaceGetHeight(surface as io_surface::IOSurfaceRef);
-            let bytes_per_row = IOSurfaceGetBytesPerRow(surface as io_surface::IOSurfaceRef);
-            // Try to get actual width, fallback to bytes_per_row/4
-            let width = IOSurfaceGetWidth(surface as io_surface::IOSurfaceRef).max(bytes_per_row / 4);
-            
-            log::trace!("Got IOSurface: {}x{} (stride={} bytes)", width, height, bytes_per_row);
-            
-            // Wrap in IOSurface struct (we already retained it above)
-            let surface = io_surface::IOSurface::wrap_under_get_rule(
-                surface as io_surface::IOSurfaceRef
-            );
-            
-            Ok(Some(Frame {
-                surface,
-                width: width as u32,
-                height: height as u32,
-            }))
+            objc::rc::autoreleasepool(|| {
+                let has_new: bool = msg_send![&*self.inner, hasNewFrame];
+                if !has_new { return Ok(None); }
+
+                let surface: *mut Object = msg_send![&*self.inner, newSurface];
+                if surface.is_null() { return Ok(None); }
+
+                // Retain so the surface outlives the autoreleasepool drain.
+                let _: () = msg_send![surface, retain];
+
+                // Consume the frame (resets hasNewFrame).
+                let texture: *mut Object = msg_send![&*self.inner, newFrameImage];
+                if !texture.is_null() {
+                    let _: () = msg_send![texture, release];
+                }
+
+                use crate::iosurface_ext::{IOSurfaceGetHeight, IOSurfaceGetBytesPerRow, IOSurfaceGetWidth};
+                let height    = IOSurfaceGetHeight(surface as io_surface::IOSurfaceRef);
+                let bytes_row = IOSurfaceGetBytesPerRow(surface as io_surface::IOSurfaceRef);
+                let width     = IOSurfaceGetWidth(surface as io_surface::IOSurfaceRef).max(bytes_row / 4);
+
+                // wrap_under_get_rule retains once more; our manual retain above
+                // balances the autorelease entry from newSurface (if any).
+                let surface = io_surface::IOSurface::wrap_under_get_rule(
+                    surface as io_surface::IOSurfaceRef
+                );
+
+                Ok(Some(Frame { surface, width: width as u32, height: height as u32 }))
+            })
         }
     }
-    
-    /// Receive a frame, blocking until one is available
+
+    /// Whether a new frame has arrived since the last `try_receive` call.
+    ///
+    /// Safe to call from any thread — autorelease pool is managed internally.
+    #[cfg(target_os = "macos")]
+    pub fn has_new_frame(&self) -> bool {
+        unsafe {
+            objc::rc::autoreleasepool(|| msg_send![&*self.inner, hasNewFrame])
+        }
+    }
+
+    /// Block until a frame is available.
     #[cfg(target_os = "macos")]
     pub fn receive(&self) -> Result<Frame> {
         loop {
-            if let Some(frame) = self.try_receive()? {
-                return Ok(frame);
-            }
-            
-            // Small yield to prevent busy-waiting
+            if let Some(frame) = self.try_receive()? { return Ok(frame); }
             std::thread::yield_now();
         }
     }
-    
-    /// Check if the server is still available
+
+    /// `true` if the underlying `SyphonMetalClient.isValid` is still set.
+    ///
+    /// Safe to call from any thread — autorelease pool is managed internally.
     #[cfg(target_os = "macos")]
     pub fn is_connected(&self) -> bool {
         unsafe {
-            let is_valid: bool = msg_send![&*self.inner, isValid];
-            is_valid
+            objc::rc::autoreleasepool(|| msg_send![&*self.inner, isValid])
         }
     }
-    
-    /// Get the server name
+
+    /// Full server metadata.
+    pub fn server_info(&self) -> &ServerInfo {
+        &self.info
+    }
+
+    /// Convenience: server display name.
     pub fn server_name(&self) -> &str {
-        &self.server_name
+        self.info.display_name()
     }
-    
-    /// Get the server application name
+
+    /// Convenience: owning application name.
     pub fn server_app(&self) -> &str {
-        &self.server_app
+        &self.info.app_name
     }
-    
-    /// Stop the client
+
     pub fn stop(&self) {
         #[cfg(target_os = "macos")]
         unsafe {
-            let _: () = msg_send![&*self.inner, stop];
+            objc::rc::autoreleasepool(|| { let _: () = msg_send![&*self.inner, stop]; });
         }
     }
 }
@@ -456,7 +532,6 @@ impl SyphonClient {
 impl Drop for SyphonClient {
     fn drop(&mut self) {
         self.stop();
-        #[cfg(target_os = "macos")]
-        log::debug!("SyphonClient for '{}' dropped", self.server_name);
+        log::debug!("[SyphonClient] dropped (server='{}')", self.info.display_name());
     }
 }

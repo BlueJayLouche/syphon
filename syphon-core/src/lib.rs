@@ -42,7 +42,7 @@ mod utils;
 mod metal_device;
 
 pub use error::{SyphonError, Result};
-pub use server::SyphonServer;
+pub use server::{SyphonServer, ServerOptions};
 pub use client::{SyphonClient, Frame};
 pub use directory::{SyphonServerDirectory, ServerInfo};
 pub use utils::{to_nsstring, from_nsstring, class_exists};

@@ -1,68 +1,118 @@
-//! Syphon Input with wgpu Integration
+//! Syphon wgpu input receiver
 //!
-//! Provides zero-copy reception of Syphon frames as wgpu textures.
-//! 
-//! ## Native BGRA Format
+//! ## Zero-copy path (default on Metal)
 //!
-//! Syphon uses native macOS BGRA8Unorm format. This module returns textures
-//! in that format directly without any conversion.
+//! When the wgpu device is backed by Metal, frames are transferred via a GPU
+//! blit from the IOSurface-backed Metal texture directly into the output wgpu
+//! texture — no CPU involvement at all.
 //!
-//! ## Example
+//! ## CPU fallback
 //!
-//! ```no_run
-//! use syphon_wgpu::SyphonWgpuInput;
-//!
-//! let mut input = SyphonWgpuInput::new(&device, &queue);
-//! input.connect("Simple Server").unwrap();
-//!
-//! if let Some(texture) = input.receive_texture(&device, &queue) {
-//!     // Texture is Bgra8Unorm (native Syphon format)
-//! }
-//! ```
+//! If the Metal HAL is unavailable (e.g. wgpu Vulkan/DX12), the frame is
+//! locked on the CPU and uploaded via `queue.write_texture`.
 
-use syphon_core::{SyphonClient, Result};
+use syphon_core::{SyphonClient, SyphonError, Result, ServerInfo};
+#[cfg(target_os = "macos")]
+use crate::metal_interop;
 
-/// Syphon input receiver that outputs wgpu textures
-///
-/// This struct handles:
-/// - Connecting to Syphon servers
-/// - Receiving frames via IOSurface
-/// - Output as wgpu textures (BGRA8Unorm native format)
 pub struct SyphonWgpuInput {
     client: Option<SyphonClient>,
     connected_server: Option<String>,
-    // Pooled texture for efficient reuse
     pool_texture: Option<wgpu::Texture>,
     pool_width: u32,
     pool_height: u32,
+    /// Metal context created from wgpu's underlying Metal device.
+    /// Present only when wgpu is backed by Metal.
+    #[cfg(target_os = "macos")]
+    metal_ctx: Option<syphon_metal::MetalContext>,
 }
 
 impl SyphonWgpuInput {
-    /// Create a new Syphon wgpu input
-    pub fn new(_device: &wgpu::Device, _queue: &wgpu::Queue) -> Self {
+    /// Create a new input receiver.
+    ///
+    /// Extracts the underlying Metal device from `device` (if Metal-backed) so
+    /// the zero-copy blit path is available immediately.
+    pub fn new(device: &wgpu::Device, _queue: &wgpu::Queue) -> Self {
+        #[cfg(target_os = "macos")]
+        let metal_ctx = Self::build_metal_ctx(device);
+
         Self {
             client: None,
             connected_server: None,
             pool_texture: None,
             pool_width: 0,
             pool_height: 0,
+            #[cfg(target_os = "macos")]
+            metal_ctx,
         }
     }
 
-    /// Connect to a Syphon server
+    #[cfg(target_os = "macos")]
+    fn build_metal_ctx(device: &wgpu::Device) -> Option<syphon_metal::MetalContext> {
+        let ctx = metal_interop::extract_metal_device(device)
+            .map(|raw| unsafe { syphon_metal::MetalContext::from_raw_device(raw) });
+        if ctx.is_none() {
+            log::warn!("[SyphonWgpuInput] wgpu device is not Metal-backed; will use CPU fallback");
+        }
+        ctx
+    }
+
+    /// Connect to a Syphon server by display name.
+    ///
+    /// Returns [`SyphonError::AmbiguousServerName`] when multiple servers share
+    /// the same name. In that case use [`connect_by_info`](Self::connect_by_info).
     pub fn connect(&mut self, server_name: &str) -> Result<()> {
-        log::info!("[SyphonWgpuInput] Connecting to: {}", server_name);
-
+        log::info!("[SyphonWgpuInput] Connecting to '{}'", server_name);
         let client = SyphonClient::connect(server_name)?;
-
         self.client = Some(client);
         self.connected_server = Some(server_name.to_string());
-
-        log::info!("[SyphonWgpuInput] Connected successfully");
+        log::info!("[SyphonWgpuInput] Connected");
         Ok(())
     }
 
-    /// Disconnect from current server
+    /// Connect using a [`ServerInfo`] obtained from `SyphonServerDirectory`.
+    /// Matches by UUID — unambiguous even when names collide.
+    pub fn connect_by_info(&mut self, info: &ServerInfo) -> Result<()> {
+        log::info!("[SyphonWgpuInput] Connecting to '{}' (uuid={})", info.display_name(), info.uuid);
+        let client = SyphonClient::connect_by_info(info)?;
+        self.connected_server = Some(info.display_name().to_string());
+        self.client = Some(client);
+        log::info!("[SyphonWgpuInput] Connected");
+        Ok(())
+    }
+
+    /// Connect with push-based delivery via a channel.
+    ///
+    /// Returns `((), receiver)`. The receiver yields `()` each time the server
+    /// publishes a new frame — no polling needed. Call [`receive_texture`](Self::receive_texture)
+    /// after waking on the channel.
+    pub fn connect_with_channel(
+        &mut self,
+        server_name: &str,
+    ) -> Result<std::sync::mpsc::Receiver<()>> {
+        log::info!("[SyphonWgpuInput] Connecting to '{}' (push mode)", server_name);
+        let (client, rx) = SyphonClient::connect_with_channel(server_name)?;
+        self.connected_server = Some(server_name.to_string());
+        self.client = Some(client);
+        log::info!("[SyphonWgpuInput] Connected (push mode)");
+        Ok(rx)
+    }
+
+    /// Connect by [`ServerInfo`] with push-based delivery.
+    ///
+    /// UUID-based — unambiguous even when names collide.
+    pub fn connect_by_info_with_channel(
+        &mut self,
+        info: &ServerInfo,
+    ) -> Result<std::sync::mpsc::Receiver<()>> {
+        log::info!("[SyphonWgpuInput] Connecting to '{}' (uuid={}, push mode)", info.display_name(), info.uuid);
+        let (client, rx) = SyphonClient::connect_by_info_with_channel(info)?;
+        self.connected_server = Some(info.display_name().to_string());
+        self.client = Some(client);
+        log::info!("[SyphonWgpuInput] Connected (push mode)");
+        Ok(rx)
+    }
+
     pub fn disconnect(&mut self) {
         self.client = None;
         self.connected_server = None;
@@ -70,96 +120,155 @@ impl SyphonWgpuInput {
         log::info!("[SyphonWgpuInput] Disconnected");
     }
 
-    /// Check if connected to a server
     pub fn is_connected(&self) -> bool {
-        self.client.is_some()
+        self.client.as_ref().map_or(false, |c| {
+            #[cfg(target_os = "macos")]
+            { c.is_connected() }
+            #[cfg(not(target_os = "macos"))]
+            { true }
+        })
     }
 
-    /// Try to receive a frame as wgpu texture
+    /// Try to receive a frame as a wgpu texture (Bgra8Unorm).
     ///
-    /// Returns None if no new frame is available.
-    /// The returned texture is always in Bgra8Unorm format (native Syphon format).
+    /// Returns `None` when no new frame is available.
+    ///
+    /// On Metal, performs a GPU-to-GPU blit with zero CPU copies.
+    /// On other backends, falls back to CPU upload.
     pub fn receive_texture(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Option<wgpu::Texture> {
-        let client = self.client.as_mut()?;
+        let client = self.client.as_ref()?;
 
-        // Try to receive frame from Syphon
-        let mut frame = match client.try_receive() {
-            Ok(Some(frame)) => frame,
-            _ => return None,
-        };
+        #[cfg(target_os = "macos")]
+        {
+            // Fast-path guard: avoid syscall if no new frame.
+            if !client.has_new_frame() { return None; }
 
-        let width = frame.width;
-        let height = frame.height;
+            let mut frame = match client.try_receive() {
+                Ok(Some(f)) => f,
+                _ => return None,
+            };
 
-        // Get BGRA data from IOSurface
-        let bgra_data = match frame.to_vec() {
-            Ok(data) => data,
-            Err(e) => {
-                log::warn!("[SyphonWgpuInput] Failed to read frame: {}", e);
-                return None;
+            let w = frame.width;
+            let h = frame.height;
+
+            // Create or reuse the output texture.
+            if self.pool_texture.is_none() || self.pool_width != w || self.pool_height != h {
+                self.pool_texture = Some(device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("syphon_input"),
+                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Bgra8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_DST
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                }));
+                self.pool_width = w;
+                self.pool_height = h;
+            }
+
+            let output = self.pool_texture.as_ref()?;
+
+            // Attempt zero-copy GPU blit; fall back to CPU on failure.
+            let used_gpu = self.metal_ctx.as_ref().map_or(false, |ctx| {
+                Self::gpu_blit(ctx, &frame, output, queue)
+            });
+
+            if !used_gpu {
+                log::warn!("[SyphonWgpuInput] GPU blit unavailable, using CPU fallback");
+                let stride = frame.bytes_per_row() as u32;
+                let data = match frame.to_vec() {
+                    Ok(d) => d,
+                    Err(e) => { log::warn!("[SyphonWgpuInput] CPU read failed: {}", e); return None; }
+                };
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: output,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &data,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(stride),
+                        rows_per_image: Some(h),
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+            }
+
+            self.pool_texture.take()
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        { None }
+    }
+
+    /// GPU-to-GPU blit: IOSurface → output wgpu texture, zero CPU copies.
+    ///
+    /// Uses wgpu's underlying Metal command queue so ordering with subsequent
+    /// wgpu render commands is preserved by Metal's queue semantics.
+    #[cfg(target_os = "macos")]
+    fn gpu_blit(
+        ctx: &syphon_metal::MetalContext,
+        frame: &syphon_core::Frame,
+        output: &wgpu::Texture,
+        queue: &wgpu::Queue,
+    ) -> bool {
+        use metal::foreign_types::ForeignType;
+
+        // Create an IOSurface-backed Metal texture on the same device as wgpu.
+        // This is zero-copy: the texture shares GPU memory with the IOSurface.
+        let src = match ctx.create_texture_from_iosurface(
+            frame.iosurface(), frame.width, frame.height,
+        ) {
+            Some(t) => t,
+            None => {
+                log::warn!("[SyphonWgpuInput] create_texture_from_iosurface failed");
+                return false;
             }
         };
 
-        let stride = bgra_data.len() as u32 / height;
+        let mut ok = false;
 
-        // Create or reuse pooled texture
-        let needs_recreate = self.pool_texture.is_none()
-            || self.pool_width != width
-            || self.pool_height != height;
-
-        if needs_recreate {
-            self.pool_texture = Some(device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Syphon Input Texture"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Bgra8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_DST
-                    | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            }));
-            self.pool_width = width;
-            self.pool_height = height;
+        unsafe {
+            objc::rc::autoreleasepool(|| {
+                // Submit the blit on wgpu's own Metal queue so Metal's command-queue
+                // ordering guarantees the blit completes before any subsequent wgpu
+                // commands that read `output`.
+                metal_interop::with_metal_queue_and_texture(queue, output, |raw_q, dst| {
+                    let cmd = raw_q.new_command_buffer();
+                    let enc = cmd.new_blit_command_encoder();
+                    enc.copy_from_texture(
+                        &src,
+                        0, 0,
+                        metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                        metal::MTLSize {
+                            width:  frame.width  as u64,
+                            height: frame.height as u64,
+                            depth:  1,
+                        },
+                        dst,
+                        0, 0,
+                        metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                    );
+                    enc.end_encoding();
+                    cmd.commit();
+                    ok = true;
+                });
+            });
         }
 
-        let texture = self.pool_texture.as_ref()?;
-
-        // Upload data to texture
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &bgra_data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(stride),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-
-        // Return the texture (taking it from the pool)
-        self.pool_texture.take()
+        ok
     }
 
-    /// Get connected server name
     pub fn server_name(&self) -> Option<&str> {
         self.connected_server.as_deref()
     }
