@@ -6,6 +6,10 @@
 //! blit from the IOSurface-backed Metal texture directly into the output wgpu
 //! texture — no CPU involvement at all.
 //!
+//! The output texture is kept alive across frames and initialized through
+//! wgpu once on creation so that wgpu's texture-initialization tracking does
+//! not zero it out before the first shader use.
+//!
 //! ## CPU fallback
 //!
 //! If the Metal HAL is unavailable (e.g. wgpu Vulkan/DX12), the frame is
@@ -18,9 +22,11 @@ use crate::metal_interop;
 pub struct SyphonWgpuInput {
     client: Option<SyphonClient>,
     connected_server: Option<String>,
-    pool_texture: Option<wgpu::Texture>,
-    pool_width: u32,
-    pool_height: u32,
+    /// Persistent output texture — initialized via wgpu on creation so
+    /// wgpu's init-tracking never zeroes it after an external Metal blit.
+    output_texture: Option<wgpu::Texture>,
+    output_width: u32,
+    output_height: u32,
     /// Metal context created from wgpu's underlying Metal device.
     /// Present only when wgpu is backed by Metal.
     #[cfg(target_os = "macos")]
@@ -39,9 +45,9 @@ impl SyphonWgpuInput {
         Self {
             client: None,
             connected_server: None,
-            pool_texture: None,
-            pool_width: 0,
-            pool_height: 0,
+            output_texture: None,
+            output_width: 0,
+            output_height: 0,
             #[cfg(target_os = "macos")]
             metal_ctx,
         }
@@ -116,7 +122,7 @@ impl SyphonWgpuInput {
     pub fn disconnect(&mut self) {
         self.client = None;
         self.connected_server = None;
-        self.pool_texture = None;
+        self.output_texture = None;
         log::info!("[SyphonWgpuInput] Disconnected");
     }
 
@@ -129,9 +135,10 @@ impl SyphonWgpuInput {
         })
     }
 
-    /// Try to receive a frame as a wgpu texture (Bgra8Unorm).
+    /// Try to receive a frame into the persistent output texture.
     ///
-    /// Returns `None` when no new frame is available.
+    /// Returns `true` when a new frame was written; `false` when no new frame
+    /// is available.  Access the result with [`output_texture`](Self::output_texture).
     ///
     /// On Metal, performs a GPU-to-GPU blit with zero CPU copies.
     /// On other backends, falls back to CPU upload.
@@ -139,25 +146,31 @@ impl SyphonWgpuInput {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-    ) -> Option<wgpu::Texture> {
-        let client = self.client.as_ref()?;
+    ) -> bool {
+        let client = match self.client.as_ref() {
+            Some(c) => c,
+            None => return false,
+        };
 
         #[cfg(target_os = "macos")]
         {
-            // Fast-path guard: avoid syscall if no new frame.
-            if !client.has_new_frame() { return None; }
+            if !client.has_new_frame() { return false; }
 
             let mut frame = match client.try_receive() {
                 Ok(Some(f)) => f,
-                _ => return None,
+                _ => return false,
             };
 
             let w = frame.width;
             let h = frame.height;
 
-            // Create or reuse the output texture.
-            if self.pool_texture.is_none() || self.pool_width != w || self.pool_height != h {
-                self.pool_texture = Some(device.create_texture(&wgpu::TextureDescriptor {
+            // Create or resize the persistent output texture.
+            // Zero-initialise via wgpu so its init-tracking marks it as "written"
+            // — otherwise wgpu clears it before the first shader use, overwriting
+            // any data the external Metal blit wrote.
+            if self.output_texture.is_none() || self.output_width != w || self.output_height != h {
+                log::info!("[SyphonWgpuInput] Creating output texture: {}x{}", w, h);
+                let tex = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("syphon_input"),
                     size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
                     mip_level_count: 1,
@@ -168,24 +181,40 @@ impl SyphonWgpuInput {
                         | wgpu::TextureUsages::COPY_DST
                         | wgpu::TextureUsages::COPY_SRC,
                     view_formats: &[],
-                }));
-                self.pool_width = w;
-                self.pool_height = h;
+                });
+                // Write zeros through wgpu to mark the texture as initialized.
+                let zeros = vec![0u8; (w * h * 4) as usize];
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &zeros,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(w * 4),
+                        rows_per_image: Some(h),
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+                self.output_texture = Some(tex);
+                self.output_width = w;
+                self.output_height = h;
             }
 
-            let output = self.pool_texture.as_ref()?;
+            let output = self.output_texture.as_ref().unwrap();
 
             // Attempt zero-copy GPU blit; fall back to CPU on failure.
-            let used_gpu = self.metal_ctx.as_ref().map_or(false, |ctx| {
-                Self::gpu_blit(ctx, &frame, output, queue)
-            });
+            let used_gpu = self.metal_ctx.is_some() && Self::gpu_blit(&frame, output, queue);
 
             if !used_gpu {
                 log::warn!("[SyphonWgpuInput] GPU blit unavailable, using CPU fallback");
                 let stride = frame.bytes_per_row() as u32;
                 let data = match frame.to_vec() {
                     Ok(d) => d,
-                    Err(e) => { log::warn!("[SyphonWgpuInput] CPU read failed: {}", e); return None; }
+                    Err(e) => { log::warn!("[SyphonWgpuInput] CPU read failed: {}", e); return false; }
                 };
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
@@ -204,45 +233,55 @@ impl SyphonWgpuInput {
                 );
             }
 
-            self.pool_texture.take()
+            return true;
         }
 
         #[cfg(not(target_os = "macos"))]
-        { None }
+        { false }
     }
 
-    /// GPU-to-GPU blit: IOSurface → output wgpu texture, zero CPU copies.
+    /// The persistent output texture, valid after [`receive_texture`](Self::receive_texture)
+    /// returns `true`.
+    pub fn output_texture(&self) -> Option<&wgpu::Texture> {
+        self.output_texture.as_ref()
+    }
+
+    /// GPU-to-GPU blit: Syphon frame texture → output wgpu texture, zero CPU copies.
     ///
-    /// Uses wgpu's underlying Metal command queue so ordering with subsequent
-    /// wgpu render commands is preserved by Metal's queue semantics.
+    /// Uses `frame.metal_texture_ptr()` — the `id<MTLTexture>` returned by
+    /// `SyphonMetalClient::newFrameImage`.  This texture was created on the
+    /// *same* Metal device as the Syphon client, so no cross-device IOSurface
+    /// re-wrapping is needed.
+    ///
+    /// Submitted on wgpu's own Metal command queue so Metal's queue-ordering
+    /// guarantee ensures the blit completes before any subsequent wgpu commands
+    /// that read `output`.
     #[cfg(target_os = "macos")]
     fn gpu_blit(
-        ctx: &syphon_metal::MetalContext,
         frame: &syphon_core::Frame,
         output: &wgpu::Texture,
         queue: &wgpu::Queue,
     ) -> bool {
         use metal::foreign_types::ForeignType;
+        use std::mem::ManuallyDrop;
 
-        // Create an IOSurface-backed Metal texture on the same device as wgpu.
-        // This is zero-copy: the texture shares GPU memory with the IOSurface.
-        let src = match ctx.create_texture_from_iosurface(
-            frame.iosurface(), frame.width, frame.height,
-        ) {
-            Some(t) => t,
-            None => {
-                log::warn!("[SyphonWgpuInput] create_texture_from_iosurface failed");
-                return false;
-            }
-        };
+        let frame_tex_ptr = frame.metal_texture_ptr();
+        if frame_tex_ptr.is_null() {
+            log::warn!("[SyphonWgpuInput] newFrameImage returned nil, cannot GPU blit");
+            return false;
+        }
+
+        // Wrap the pointer as metal::Texture so we can pass &*src to the blit
+        // encoder.  ManuallyDrop prevents the implicit ObjC release on drop —
+        // Frame::drop already owns the matching retain.
+        let src = ManuallyDrop::new(unsafe {
+            metal::Texture::from_ptr(frame_tex_ptr as *mut _)
+        });
 
         let mut ok = false;
 
         unsafe {
             objc::rc::autoreleasepool(|| {
-                // Submit the blit on wgpu's own Metal queue so Metal's command-queue
-                // ordering guarantees the blit completes before any subsequent wgpu
-                // commands that read `output`.
                 metal_interop::with_metal_queue_and_texture(queue, output, |raw_q, dst| {
                     let cmd = raw_q.new_command_buffer();
                     let enc = cmd.new_blit_command_encoder();

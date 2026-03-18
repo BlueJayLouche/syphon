@@ -16,8 +16,29 @@ use objc_id::ShareId;
 pub struct Frame {
     #[cfg(target_os = "macos")]
     pub(crate) surface: io_surface::IOSurface,
+    /// Retained `newFrameImage` Metal texture — kept alive so Syphon doesn't
+    /// recycle the underlying IOSurface back to the server until this frame
+    /// is fully consumed (blit complete).  Released in `Drop`.
+    #[cfg(target_os = "macos")]
+    frame_texture: *mut objc::runtime::Object,
     pub width: u32,
     pub height: u32,
+}
+
+#[cfg(target_os = "macos")]
+unsafe impl Send for Frame {}
+#[cfg(target_os = "macos")]
+unsafe impl Sync for Frame {}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            if !self.frame_texture.is_null() {
+                let _: () = objc::msg_send![self.frame_texture, release];
+            }
+        }
+    }
 }
 
 impl Frame {
@@ -30,6 +51,21 @@ impl Frame {
     #[cfg(target_os = "macos")]
     pub fn iosurface(&self) -> &io_surface::IOSurface {
         &self.surface
+    }
+
+    /// Raw pointer to the `id<MTLTexture>` returned by `newFrameImage`.
+    ///
+    /// This is the authoritative texture managed by `SyphonMetalClient` — it
+    /// was created on the *same* Metal device as the client, so it is safe to
+    /// use as a blit source on that device.  The texture is retained for the
+    /// lifetime of this `Frame`; Metal command buffers additionally retain
+    /// every resource they reference, so it is safe to commit a blit and then
+    /// drop the frame before the GPU work completes.
+    ///
+    /// Returns `null` if `newFrameImage` returned `nil` (server stopped, etc.).
+    #[cfg(target_os = "macos")]
+    pub fn metal_texture_ptr(&self) -> *mut objc::runtime::Object {
+        self.frame_texture
     }
 
     #[cfg(target_os = "macos")]
@@ -442,30 +478,24 @@ impl SyphonClient {
                 let has_new: bool = msg_send![&*self.inner, hasNewFrame];
                 if !has_new { return Ok(None); }
 
-                let surface: *mut Object = msg_send![&*self.inner, newSurface];
-                if surface.is_null() { return Ok(None); }
+                // `newFrameImage` returns a RETAINED id<MTLTexture> (Cocoa "new" rule —
+                // caller owns the +1 retain).  Do NOT call retain again; Frame::drop
+                // calls release exactly once.
+                let frame_texture: *mut Object = msg_send![&*self.inner, newFrameImage];
+                if frame_texture.is_null() { return Ok(None); }
 
-                // Retain so the surface outlives the autoreleasepool drain.
-                let _: () = msg_send![surface, retain];
+                // Get dimensions from the Metal texture directly — public API,
+                // no private selectors needed.
+                let width:  u64 = msg_send![frame_texture, width];
+                let height: u64 = msg_send![frame_texture, height];
 
-                // Consume the frame (resets hasNewFrame).
-                let texture: *mut Object = msg_send![&*self.inner, newFrameImage];
-                if !texture.is_null() {
-                    let _: () = msg_send![texture, release];
-                }
+                // `MTLTexture.iosurface` is a property getter (get-rule: not retained).
+                // wrap_under_get_rule retains once; IOSurface::drop releases once → net zero.
+                let ios_ref: io_surface::IOSurfaceRef = msg_send![frame_texture, iosurface];
+                if ios_ref.is_null() { return Ok(None); }
+                let surface = io_surface::IOSurface::wrap_under_get_rule(ios_ref);
 
-                use crate::iosurface_ext::{IOSurfaceGetHeight, IOSurfaceGetBytesPerRow, IOSurfaceGetWidth};
-                let height    = IOSurfaceGetHeight(surface as io_surface::IOSurfaceRef);
-                let bytes_row = IOSurfaceGetBytesPerRow(surface as io_surface::IOSurfaceRef);
-                let width     = IOSurfaceGetWidth(surface as io_surface::IOSurfaceRef).max(bytes_row / 4);
-
-                // wrap_under_get_rule retains once more; our manual retain above
-                // balances the autorelease entry from newSurface (if any).
-                let surface = io_surface::IOSurface::wrap_under_get_rule(
-                    surface as io_surface::IOSurfaceRef
-                );
-
-                Ok(Some(Frame { surface, width: width as u32, height: height as u32 }))
+                Ok(Some(Frame { surface, frame_texture, width: width as u32, height: height as u32 }))
             })
         }
     }
