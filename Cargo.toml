@@ -9,6 +9,6 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-authors = ["Your Name <you@example.com>"]
+authors = ["BlueJayLouche <bluejaylouche@gmail.com>"]
 license = "MIT"
-repository = "https://github.com/yourusername/syphon-rs"
+repository = "https://github.com/BlueJayLouche/syphon-rs"
