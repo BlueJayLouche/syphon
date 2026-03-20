@@ -44,7 +44,7 @@ This workspace provides Rust crates for integrating Syphon frame sharing into yo
 
 ```bash
 # Clone with submodules (includes Syphon framework)
-git clone --recursive https://github.com/yourusername/syphon.git
+git clone --recursive https://github.com/BlueJayLouche/syphon-rs.git
 cd syphon
 
 # Or if already cloned
