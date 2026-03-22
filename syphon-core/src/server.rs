@@ -157,7 +157,8 @@ impl SyphonServer {
                     options: options_dict
                 ];
 
-                let _: () = msg_send![ns_name, release];
+                // ns_name is autoreleased (from stringWithUTF8String:) —
+                // do NOT release it; the enclosing autoreleasepool handles it.
                 if !options_dict.is_null() {
                     let _: () = msg_send![options_dict, release];
                 }
