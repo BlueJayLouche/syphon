@@ -3,7 +3,6 @@
 //! Uses NSNotificationCenter-driven discovery via `requestServerAnnounce` and a
 //! single run-loop spin, replacing the old 1.5-second polling loop.
 
-use crate::{Result, SyphonError};
 
 #[cfg(target_os = "macos")]
 use objc::runtime::{Class, Object};
@@ -65,7 +64,6 @@ impl SyphonServerDirectory {
 
     #[cfg(target_os = "macos")]
     unsafe fn servers_inner() -> Vec<ServerInfo> {
-        use crate::utils::from_nsstring;
         use objc::rc::autoreleasepool;
 
         let dir = Self::shared_directory();

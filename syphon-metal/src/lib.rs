@@ -193,7 +193,7 @@ impl MetalContext {
         use objc::{msg_send, sel, sel_impl};
         use cocoa::foundation::NSUInteger;
         use metal::{MTLStorageMode, MTLTextureUsage, MTLPixelFormat};
-        use foreign_types_shared::{ForeignType, ForeignTypeRef};
+        use foreign_types_shared::ForeignType;
         
         unsafe {
             // Create texture descriptor
@@ -303,75 +303,69 @@ impl MetalContext {
 }
 
 /// Helper to extract raw Metal handles from wgpu objects using wgpu-hal
+///
+/// Updated for wgpu 29: `as_hal` no longer accepts a closure; it returns
+/// `Option<impl Deref<Target = ...>>` directly. `Queue::as_raw()` was removed —
+/// the MTLCommandQueue is no longer publicly accessible via wgpu-hal.
 #[cfg(all(feature = "wgpu", target_os = "macos"))]
 pub mod wgpu_interop {
-    use foreign_types_shared::ForeignType;
-    
-    /// Extract the raw Metal device from a wgpu device
-    /// 
+    use foreign_types_shared::{ForeignType, ForeignTypeRef};
+
+    /// Extract the raw Metal device from a wgpu device.
+    ///
     /// # Safety
-    /// This uses wgpu's `as_hal` API to access the underlying Metal device.
-    /// The returned device reference is only valid for the duration of the callback.
-    pub unsafe fn with_metal_device<F, R>(device: &wgpu::Device, f: F) -> R
-    where
-        F: FnOnce(Option<&metal::Device>) -> R,
-    {
-        device.as_hal::<wgpu_hal::api::Metal, _, _>(|hal_device| {
-            match hal_device {
-                Some(dev) => {
-                    let raw_device = dev.raw_device().lock();
-                    f(Some(&*raw_device))
-                }
-                None => f(None),
-            }
-        })
+    /// The caller must not use the returned `metal::Device` past the point where
+    /// the wgpu device is dropped. The device is retained internally, so it is
+    /// safe to hold onto independently.
+    pub unsafe fn extract_metal_device(device: &wgpu::Device) -> Option<metal::Device> {
+        // Retain via direct libobjc call to avoid objc crate's sel! macro scoping.
+        extern "C" {
+            fn objc_retain(value: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        }
+
+        let hal_guard = device.as_hal::<wgpu_hal::api::Metal>()?;
+        // raw_device() → &Retained<ProtocolObject<dyn MTLDevice>>
+        // ProtocolObject<P> is #[repr(C)] over zero-sized AnyObject; the pointer
+        // is a thin ObjC id<MTLDevice>. Both metal-rs and objc2 wrap the same type.
+        let proto_ref = &**hal_guard.raw_device();
+        let raw_ptr = proto_ref as *const _ as *mut metal::MTLDevice;
+        // Retain before handing to metal-rs so its drop doesn't over-release.
+        objc_retain(raw_ptr as *mut _);
+        Some(metal::Device::from_ptr(raw_ptr))
     }
-    
-    /// Extract the raw Metal queue from a wgpu queue
-    /// 
+
+    /// Call `f` with the raw `MTLTextureRef` backing a wgpu texture.
+    ///
+    /// `f` receives `None` when the texture is not Metal-backed.
+    /// The reference is only valid for the duration of `f`.
+    ///
     /// # Safety
-    /// This uses wgpu's `as_hal` API to access the underlying Metal queue.
-    pub unsafe fn with_metal_queue<F, R>(queue: &wgpu::Queue, f: F) -> R
-    where
-        F: FnOnce(Option<&metal::CommandQueue>) -> R,
-    {
-        queue.as_hal::<wgpu_hal::api::Metal, _, _>(|hal_queue| {
-            match hal_queue {
-                Some(q) => {
-                    let raw_queue = q.as_raw().lock();
-                    f(Some(&*raw_queue))
-                }
-                None => f(None),
-            }
-        })
-    }
-    
-    /// Extract the raw Metal texture from a wgpu texture
-    /// 
-    /// # Safety
-    /// This uses wgpu's `as_hal` API to access the underlying Metal texture.
-    /// The returned texture reference is only valid for the duration of the callback.
+    /// The wgpu texture must remain valid (not dropped) while `f` runs.
     pub unsafe fn with_metal_texture<F, R>(texture: &wgpu::Texture, f: F) -> R
     where
-        F: FnOnce(Option<&metal::Texture>) -> R,
+        F: FnOnce(Option<&metal::TextureRef>) -> R,
     {
-        texture.as_hal::<wgpu_hal::api::Metal, _, _>(|hal_texture| {
-            match hal_texture {
-                Some(tex) => {
-                    let raw_tex = tex.raw_handle();
-                    f(Some(raw_tex))
-                }
-                None => f(None),
+        match texture.as_hal::<wgpu_hal::api::Metal>() {
+            Some(hal_guard) => {
+                // raw_handle() → &ProtocolObject<dyn MTLTexture> (thin pointer)
+                let proto_ref = hal_guard.raw_handle();
+                let raw_ptr = proto_ref as *const _ as *const metal::MTLTexture;
+                f(Some(metal::TextureRef::from_ptr(raw_ptr as *mut _)))
             }
-        })
+            None => f(None),
+        }
     }
-    
-    /// Get the raw MTLTexture pointer from a wgpu texture
-    /// 
+
+    /// Get the raw `id<MTLTexture>` pointer from a wgpu texture.
+    ///
+    /// Returns `None` if the texture is not Metal-backed.
+    /// The pointer is only valid while the wgpu texture is alive.
+    ///
     /// # Safety
-    /// Returns a pointer to the underlying `id<MTLTexture>`. 
-    /// This pointer is only valid until the wgpu texture is dropped.
-    pub unsafe fn get_metal_texture_ptr(texture: &wgpu::Texture) -> Option<*mut objc::runtime::Object> {
+    /// The wgpu texture must remain alive while the returned pointer is in use.
+    pub unsafe fn get_metal_texture_ptr(
+        texture: &wgpu::Texture,
+    ) -> Option<*mut objc::runtime::Object> {
         with_metal_texture(texture, |mtl_tex| {
             mtl_tex.map(|t| t.as_ptr() as *mut objc::runtime::Object)
         })

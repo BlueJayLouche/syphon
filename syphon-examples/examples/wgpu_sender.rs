@@ -36,9 +36,9 @@ fn run() {
     
     // Create wgpu instance
     println!("\nInitializing wgpu...");
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::METAL,
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     
     // Create wgpu adapter and device - FORCE high performance (discrete GPU)
@@ -59,6 +59,7 @@ fn run() {
             required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::default(),
         },
     )).expect("Failed to create device");
     
@@ -115,6 +116,7 @@ fn run() {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &output_view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: (elapsed.sin() * 0.5 + 0.5) as f64,
@@ -128,6 +130,7 @@ fn run() {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
         }
         

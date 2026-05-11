@@ -15,7 +15,7 @@
 //! If the Metal HAL is unavailable (e.g. wgpu Vulkan/DX12), the frame is
 //! locked on the CPU and uploaded via `queue.write_texture`.
 
-use syphon_core::{SyphonClient, SyphonError, Result, ServerInfo};
+use syphon_core::{SyphonClient, Result, ServerInfo};
 #[cfg(target_os = "macos")]
 use crate::metal_interop;
 
@@ -207,7 +207,14 @@ impl SyphonWgpuInput {
             let output = self.output_texture.as_ref().unwrap();
 
             // Attempt zero-copy GPU blit; fall back to CPU on failure.
-            let used_gpu = self.metal_ctx.is_some() && Self::gpu_blit(&frame, output, queue);
+            // Poll wgpu before the Metal blit to ensure prior render work is done
+            // (wgpu 29 no longer exposes its MTLCommandQueue for cross-queue ordering).
+            let used_gpu = if let Some(ref ctx) = self.metal_ctx {
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                Self::gpu_blit(&frame, output, ctx.queue())
+            } else {
+                false
+            };
 
             if !used_gpu {
                 log::warn!("[SyphonWgpuInput] GPU blit unavailable, using CPU fallback");
@@ -256,11 +263,17 @@ impl SyphonWgpuInput {
     /// Submitted on wgpu's own Metal command queue so Metal's queue-ordering
     /// guarantee ensures the blit completes before any subsequent wgpu commands
     /// that read `output`.
+    /// GPU-to-GPU blit using a dedicated Metal command queue.
+    ///
+    /// In wgpu 29, `Queue::as_hal` no longer exposes the internal `MTLCommandQueue`,
+    /// so we use the queue from `MetalContext` instead. The caller must call
+    /// `device.poll(PollType::wait_indefinitely())` before invoking this to ensure
+    /// all prior wgpu rendering is complete on the GPU.
     #[cfg(target_os = "macos")]
     fn gpu_blit(
         frame: &syphon_core::Frame,
         output: &wgpu::Texture,
-        queue: &wgpu::Queue,
+        metal_queue: &metal::CommandQueue,
     ) -> bool {
         use metal::foreign_types::ForeignType;
         use std::mem::ManuallyDrop;
@@ -282,8 +295,8 @@ impl SyphonWgpuInput {
 
         unsafe {
             objc::rc::autoreleasepool(|| {
-                metal_interop::with_metal_queue_and_texture(queue, output, |raw_q, dst| {
-                    let cmd = raw_q.new_command_buffer();
+                metal_interop::with_metal_texture(output, |dst| {
+                    let cmd = metal_queue.new_command_buffer();
                     let enc = cmd.new_blit_command_encoder();
                     enc.copy_from_texture(
                         &src,

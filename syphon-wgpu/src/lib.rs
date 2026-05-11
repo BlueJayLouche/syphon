@@ -92,14 +92,13 @@ mod metal_interop;
 use metal::*;
 #[cfg(target_os = "macos")]
 use metal::foreign_types::{ForeignType, ForeignTypeRef};
+// sel and sel_impl are needed for msg_send! macro expansion even though the
+// lint reports them as unused — rustc does not track macro-internal references.
+#[cfg(target_os = "macos")]
+#[allow(unused_imports)]
+use objc::{sel, sel_impl};
 #[cfg(target_os = "macos")]
 use objc::runtime::Object;
-#[cfg(target_os = "macos")]
-use objc::{msg_send, sel, sel_impl};
-#[cfg(target_os = "macos")]
-use cocoa::foundation::NSUInteger;
-#[cfg(target_os = "macos")]
-use core_foundation::base::TCFType;
 
 /// High-level wgpu-to-Syphon output with zero-copy GPU transfer
 /// 
@@ -289,8 +288,8 @@ impl SyphonWgpuOutput {
     fn publish_zero_copy(
         &mut self,
         texture: &wgpu::Texture,
-        _device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        device: &wgpu::Device,
+        _queue: &wgpu::Queue,
     ) -> PublishStatus {
         let surface = match self.surface_pool.acquire() {
             Some(s) => s,
@@ -305,18 +304,22 @@ impl SyphonWgpuOutput {
 
         let mut published = false;
 
-        // Submit the blit on wgpu's own Metal queue so Metal's command-queue
-        // ordering guarantees it completes before subsequent wgpu render commands.
+        // In wgpu 29, the internal MTLCommandQueue is no longer accessible via
+        // wgpu-hal. We use our own metal_queue and poll wgpu first to ensure
+        // all prior GPU rendering is complete before we blit.
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+
         unsafe {
             objc::rc::autoreleasepool(|| {
-                metal_interop::with_metal_queue_and_texture(queue, texture, |raw_queue, src_texture| {
+                metal_interop::with_metal_texture(texture, |src_texture| {
                     let Some(ref metal_device) = self.metal_device else { return };
+                    let Some(ref metal_queue) = self.metal_queue else { return };
 
                     let Some(dest_texture) = Self::create_iosurface_texture(
                         metal_device, &surface, self.width, self.height
                     ) else { return };
 
-                    let cmd_buf = raw_queue.new_command_buffer();
+                    let cmd_buf = metal_queue.new_command_buffer();
                     let blit = cmd_buf.new_blit_command_encoder();
                     blit.copy_from_texture(
                         src_texture,
@@ -440,7 +443,7 @@ impl SyphonWgpuOutput {
         queue.submit(std::iter::once(encoder.finish()));
         
         // Wait for GPU
-        let _ = device.poll(wgpu::PollType::Wait);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
         
         // Map and upload
         let buffer_slice = buffer.slice(..);

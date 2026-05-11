@@ -7,12 +7,12 @@ edition = "2021"
 syphon-core = { path = "../syphon-core" }
 syphon-metal = { path = "../syphon-metal" }
 syphon-wgpu = { path = "../syphon-wgpu" }
-wgpu = "25.0"
-pollster = "0.3"
+wgpu = "29.0"
+pollster = "0.4"
 env_logger = "0.11"
 log = "0.4"
 bytemuck = { version = "1.21", features = ["derive"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-metal = "0.31"
+metal = "0.33"
 objc = "0.2"

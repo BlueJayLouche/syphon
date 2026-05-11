@@ -80,9 +80,9 @@ fn main() {
 }
 
 fn setup_wgpu() -> Result<(wgpu::Device, wgpu::Queue), Box<dyn std::error::Error>> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::METAL,
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     
     // Try high performance first (discrete GPU), then fall back
@@ -101,6 +101,7 @@ fn setup_wgpu() -> Result<(wgpu::Device, wgpu::Queue), Box<dyn std::error::Error
             required_limits: wgpu::Limits::downlevel_webgl2_defaults(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::default(),
         },
     ))?;
     
